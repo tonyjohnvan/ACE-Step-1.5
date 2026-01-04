@@ -257,15 +257,15 @@ class PlaygroundHandler:
         track_type: Optional[str] = None,
         # Progress callback
         progress=None
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], str, str]:
+    ) -> Tuple[Optional[str], str]:
         """
         Generate audio using DiT model.
         
         Returns:
-            Tuple of (first_audio, second_audio, source_audio, mixed_1, mixed_2, status, actual_texts)
+            Tuple of (audio_file_path, status_message)
         """
         if self.dit_handler.model is None:
-            return None, None, None, None, None, "❌ DiT model not initialized. Please load the DiT model first.", ""
+            return None, "❌ DiT model not initialized. Please load the DiT model first."
         
         try:
             # Map UI task names to internal task names
@@ -303,7 +303,7 @@ class PlaygroundHandler:
                 seed=seed,
                 reference_audio=reference_audio_path,  # Reference audio for style
                 audio_duration=-1,  # Use default or derive from src_audio
-                batch_size=2,
+                batch_size=1,
                 src_audio=source_audio_path if internal_task in ["repaint", "cover", "lego", "complete", "extract"] else None,
                 audio_code_string=audio_codes,
                 repainting_start=repainting_start,
@@ -329,79 +329,14 @@ class PlaygroundHandler:
                 second_audio = result[1]  # second_audio
                 status = result[4]  # status_message
                 actual_texts = result[6] if len(result) > 6 else ""
-                actual_texts_str = ""
                 if actual_texts and len(actual_texts) > 0:
                     actual_texts_str = actual_texts[0].replace("\\n", "\n")
-                
-                # For add/complete tasks, create mixed audio (source + generated)
-                source_out = None
-                mixed_1 = None
-                mixed_2 = None
-                
-                if internal_task in ["lego", "complete"] and source_audio_path:
-                    source_out = source_audio_path
-                    mixed_1, mixed_2 = self._mix_audio(source_audio_path, first_audio, second_audio, audio_format)
-                
-                return first_audio, second_audio, source_out, mixed_1, mixed_2, status, actual_texts_str
+                return first_audio, second_audio, status, actual_texts_str
             else:
-                return None, None, None, None, None, "❌ Unexpected result format", ""
+                return None, None, "❌ Unexpected result format", ""
             
         except Exception as e:
-            return None, None, None, None, None, f"❌ Error generating audio: {str(e)}\n{traceback.format_exc()}", ""
-    
-    def _mix_audio(
-        self, 
-        source_path: str, 
-        audio1_path: Optional[str], 
-        audio2_path: Optional[str],
-        audio_format: str = "mp3"
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Mix source audio with generated audio.
-        
-        Args:
-            source_path: Path to source audio file
-            audio1_path: Path to first generated audio
-            audio2_path: Path to second generated audio
-            audio_format: Output audio format
-            
-        Returns:
-            Tuple of (mixed_1_path, mixed_2_path)
-        """
-        try:
-            from pydub import AudioSegment
-            import tempfile
-            
-            source = AudioSegment.from_file(source_path)
-            mixed_1_path = None
-            mixed_2_path = None
-            
-            if audio1_path:
-                gen1 = AudioSegment.from_file(audio1_path)
-                # Overlay: mix the two audio tracks together
-                mixed1 = source.overlay(gen1)
-                mixed_1_path = tempfile.NamedTemporaryFile(
-                    suffix=f".{audio_format}", 
-                    delete=False
-                ).name
-                mixed1.export(mixed_1_path, format=audio_format)
-            
-            if audio2_path:
-                gen2 = AudioSegment.from_file(audio2_path)
-                mixed2 = source.overlay(gen2)
-                mixed_2_path = tempfile.NamedTemporaryFile(
-                    suffix=f".{audio_format}", 
-                    delete=False
-                ).name
-                mixed2.export(mixed_2_path, format=audio_format)
-            
-            return mixed_1_path, mixed_2_path
-        except ImportError:
-            print("Warning: pydub not installed. Cannot mix audio. Install with: pip install pydub")
-            return None, None
-        except Exception as e:
-            print(f"Error mixing audio: {e}")
-            return None, None
+            return None, None, f"❌ Error generating audio: {str(e)}\n{traceback.format_exc()}", ""
     
     # =========================================================================
     # Status Properties
