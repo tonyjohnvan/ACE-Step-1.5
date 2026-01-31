@@ -9,6 +9,10 @@ Endpoints:
 - GET  /v1/audio              Download audio file
 - GET  /health                Health check
 
+OpenRouter Compatible Endpoints:
+- POST /v1/chat/completions   Generate music via chat completion format
+- GET  /v1/models             List models in OpenRouter format
+
 NOTE:
 - In-memory queue and job store -> run uvicorn with workers=1.
 """
@@ -1526,6 +1530,15 @@ def create_app() -> FastAPI:
             executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="ACE-Step API", version="1.0", lifespan=lifespan)
+
+    # Integrate OpenRouter-compatible endpoints
+    try:
+        from acestep.openrouter_adapter import create_openrouter_router
+        openrouter_router = create_openrouter_router(lambda: app.state)
+        app.include_router(openrouter_router, tags=["OpenRouter Compatible"])
+        print("[API Server] OpenRouter-compatible endpoints enabled")
+    except ImportError as e:
+        print(f"[API Server] OpenRouter adapter not available: {e}")
 
     async def _queue_position(job_id: str) -> int:
         async with app.state.pending_lock:
