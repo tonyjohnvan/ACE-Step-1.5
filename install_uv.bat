@@ -73,9 +73,10 @@ powershell -Command "Write-Host 'PowerShell is available'" >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
     REM Install uv using PowerShell
     if %SILENT_MODE% EQU 1 (
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "& {try { $ProgressPreference = 'SilentlyContinue'; Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression } catch { exit 1 }}" >nul 2>&1
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression" >nul 2>&1
     ) else (
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "& {Write-Host 'Downloading uv installer...' -ForegroundColor Cyan; try { $ProgressPreference = 'SilentlyContinue'; Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression; Write-Host ''; Write-Host '========================================' -ForegroundColor Green; Write-Host 'uv installed successfully!' -ForegroundColor Green; Write-Host '========================================' -ForegroundColor Green } catch { Write-Host ''; Write-Host '========================================' -ForegroundColor Red; Write-Host 'Installation failed!' -ForegroundColor Red; Write-Host '========================================' -ForegroundColor Red; Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }}"
+        echo Downloading uv installer...
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression"
     )
 
     if !ERRORLEVEL! EQU 0 (

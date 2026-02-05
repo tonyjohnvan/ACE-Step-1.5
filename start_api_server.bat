@@ -20,6 +20,19 @@ REM set DOWNLOAD_SOURCE=--download-source modelscope
 REM set DOWNLOAD_SOURCE=--download-source huggingface
 set DOWNLOAD_SOURCE=
 
+REM LLM (Language Model) initialization settings
+REM By default, LLM is auto-enabled/disabled based on GPU VRAM:
+REM   - <=6GB VRAM: LLM disabled (DiT-only mode)
+REM   - >6GB VRAM: LLM enabled
+REM Values: auto (default), true (force enable), false (force disable)
+REM set ACESTEP_INIT_LLM=auto
+REM set ACESTEP_INIT_LLM=true
+REM set ACESTEP_INIT_LLM=false
+
+REM LM model path (optional, only used when LLM is enabled)
+REM Available models: acestep-5Hz-lm-0.6B, acestep-5Hz-lm-1.7B, acestep-5Hz-lm-4B
+REM set LM_MODEL_PATH=--lm-model-path acestep-5Hz-lm-0.6B
+
 REM Update check settings (for portable package users with PortableGit)
 REM Check for updates from GitHub before starting
 set CHECK_UPDATE=false
@@ -77,6 +90,7 @@ if exist "%~dp0python_embeded\python.exe" (
     set "CMD=--host %HOST% --port %PORT%"
     if not "%API_KEY%"=="" set "CMD=!CMD! %API_KEY%"
     if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
+    if not "%LM_MODEL_PATH%"=="" set "CMD=!CMD! %LM_MODEL_PATH%"
 
     "!PYTHON_EXE!" "!SCRIPT_PATH!" !CMD!
 ) else (
@@ -216,6 +230,7 @@ if exist "%~dp0python_embeded\python.exe" (
     set "CMD=uv run acestep-api --host %HOST% --port %PORT%"
     if not "%API_KEY%"=="" set "CMD=!CMD! %API_KEY%"
     if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
+    if not "%LM_MODEL_PATH%"=="" set "CMD=!CMD! %LM_MODEL_PATH%"
 
     !CMD!
 )

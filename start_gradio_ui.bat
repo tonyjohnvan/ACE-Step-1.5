@@ -20,6 +20,15 @@ set CONFIG_PATH=--config_path acestep-v15-turbo
 set LM_MODEL_PATH=--lm_model_path acestep-5Hz-lm-0.6B
 REM set OFFLOAD_TO_CPU=--offload_to_cpu true
 
+REM LLM (Language Model) initialization settings
+REM By default, LLM is auto-enabled/disabled based on GPU VRAM:
+REM   - <=6GB VRAM: LLM disabled (DiT-only mode)
+REM   - >6GB VRAM: LLM enabled
+REM Values: auto (default), true (force enable), false (force disable)
+REM set INIT_LLM=--init_llm auto
+REM set INIT_LLM=--init_llm true
+REM set INIT_LLM=--init_llm false
+
 REM Download source settings
 REM Preferred download source: auto (default), huggingface, or modelscope
 REM set DOWNLOAD_SOURCE=--download-source modelscope
@@ -95,6 +104,7 @@ if exist "%~dp0python_embeded\python.exe" (
     if not "%CONFIG_PATH%"=="" set "CMD=!CMD! %CONFIG_PATH%"
     if not "%LM_MODEL_PATH%"=="" set "CMD=!CMD! %LM_MODEL_PATH%"
     if not "%OFFLOAD_TO_CPU%"=="" set "CMD=!CMD! %OFFLOAD_TO_CPU%"
+    if not "%INIT_LLM%"=="" set "CMD=!CMD! %INIT_LLM%"
     if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
     if not "%INIT_SERVICE%"=="" set "CMD=!CMD! %INIT_SERVICE%"
     if not "%ENABLE_API%"=="" set "CMD=!CMD! %ENABLE_API%"
