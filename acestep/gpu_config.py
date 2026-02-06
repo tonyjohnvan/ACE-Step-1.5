@@ -2,10 +2,14 @@
 GPU Configuration Module
 Centralized GPU memory detection and adaptive configuration management
 
+Override Mode:
+    Set environment variable ACESTEP_GPU_MEMORY_GB to override detected GPU memory.
+    Example: ACESTEP_GPU_MEMORY_GB=48 python acestep
+
 Debug Mode:
     Set environment variable MAX_CUDA_VRAM to simulate different GPU memory sizes.
     Example: MAX_CUDA_VRAM=8 python acestep  # Simulates 8GB GPU
-    
+
     This is useful for testing GPU tier configurations on high-end hardware.
 """
 
@@ -16,6 +20,8 @@ from typing import Optional, List, Dict, Tuple
 from loguru import logger
 
 
+# Environment variable for explicit GPU memory override
+OVERRIDE_GPU_MEMORY_ENV = "ACESTEP_GPU_MEMORY_GB"
 # Environment variable for debugging/testing different GPU memory configurations
 DEBUG_MAX_CUDA_VRAM_ENV = "MAX_CUDA_VRAM"
 
@@ -114,13 +120,32 @@ def get_gpu_memory_gb() -> float:
     """
     Get GPU memory in GB. Returns 0 if no GPU is available.
     
+    Override Mode:
+        Set environment variable ACESTEP_GPU_MEMORY_GB to override the detected GPU memory.
+        Example: ACESTEP_GPU_MEMORY_GB=48 python acestep
+
     Debug Mode:
-        Set environment variable MAX_CUDA_VRAM to override the detected GPU memory.
+        Set environment variable MAX_CUDA_VRAM to simulate different GPU memory sizes.
         Example: MAX_CUDA_VRAM=8 python acestep  # Simulates 8GB GPU
-        
+
         This allows testing different GPU tier configurations on high-end hardware.
     """
-    # Check for debug override first
+    # Check for explicit override first
+    override_vram = os.environ.get(OVERRIDE_GPU_MEMORY_ENV)
+    if override_vram is not None:
+        try:
+            override_gb = float(override_vram)
+            if override_gb < 0:
+                raise ValueError("negative")
+            logger.info(
+                f"Using GPU memory override: {override_gb:.1f}GB "
+                f"(set via {OVERRIDE_GPU_MEMORY_ENV})"
+            )
+            return override_gb
+        except ValueError:
+            logger.warning(f"Invalid {OVERRIDE_GPU_MEMORY_ENV} value: {override_vram}, ignoring")
+
+    # Check for debug override
     debug_vram = os.environ.get(DEBUG_MAX_CUDA_VRAM_ENV)
     if debug_vram is not None:
         try:
@@ -142,6 +167,12 @@ def get_gpu_memory_gb() -> float:
             total_memory = torch.xpu.get_device_properties(0).total_memory
             memory_gb = total_memory / (1024**3)  # Convert bytes to GB
             return memory_gb
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            logger.info(
+                "MPS backend detected, but total VRAM is not reported by PyTorch. "
+                f"Set {OVERRIDE_GPU_MEMORY_ENV} to override."
+            )
+            return 0
         else:
             return 0
     except Exception as e:
