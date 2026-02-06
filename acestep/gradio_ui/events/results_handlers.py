@@ -34,6 +34,39 @@ DEFAULT_RESULTS_DIR = os.path.join(PROJECT_ROOT, "gradio_outputs").replace("\\",
 os.makedirs(DEFAULT_RESULTS_DIR, exist_ok=True)
 
 
+def _replace_extension(path: str, fmt: str) -> str:
+    base, _ = os.path.splitext(path)
+    return f"{base}.{fmt}"
+
+
+def _save_audio_with_fallback(audio_tensor, base_path, sample_rate, requested_format):
+    requested_format = (requested_format or "flac").lower()
+    if requested_format == "mp3":
+        fallback_formats = ["wav", "flac"]
+    elif requested_format == "flac":
+        fallback_formats = ["wav"]
+    else:
+        fallback_formats = ["wav", "flac"]
+    formats_to_try = [requested_format] + [fmt for fmt in fallback_formats if fmt != requested_format]
+    errors = []
+    for fmt in formats_to_try:
+        output_path = _replace_extension(base_path, fmt)
+        try:
+            save_audio(
+                audio_data=audio_tensor,
+                output_path=output_path,
+                sample_rate=sample_rate,
+                format=fmt,
+                channels_first=True,
+            )
+            return output_path, fmt, errors
+        except Exception as e:
+            err_msg = str(e)
+            errors.append((fmt, err_msg))
+            logger.warning(f"[audio_save] Failed to save {fmt} audio: {err_msg}")
+    return None, requested_format, errors
+
+
 def parse_lrc_to_subtitles(lrc_text: str, total_duration: Optional[float] = None) -> List[Dict[str, Any]]:
     """
     Parse LRC lyrics text to Gradio subtitles format with SMART POST-PROCESSING.
@@ -703,11 +736,28 @@ def generate_with_progress(
             os.makedirs(temp_dir, exist_ok=True)
             json_path = os.path.join(temp_dir, f"{key}.json").replace("\\", "/")
             audio_path = os.path.join(temp_dir, f"{key}.{audio_format}").replace("\\", "/")
-            save_audio(audio_data=audio_tensor, output_path=audio_path, sample_rate=sample_rate, format=audio_format, channels_first=True)
+            saved_audio_path, actual_format, save_errors = _save_audio_with_fallback(
+                audio_tensor=audio_tensor,
+                base_path=audio_path,
+                sample_rate=sample_rate,
+                requested_format=audio_format,
+            )
+            if saved_audio_path is None:
+                error_msg = save_errors[-1][1] if save_errors else "Unknown error"
+                audio_params["audio_save_error"] = error_msg
+                gr.Warning(t("messages.audio_save_failed", error=error_msg))
+            elif actual_format != (audio_format or "").lower():
+                error_msg = save_errors[0][1] if save_errors else "Unknown error"
+                audio_params["audio_format_requested"] = audio_format
+                audio_params["audio_format_actual"] = actual_format
+                audio_params["audio_save_error"] = error_msg
+                gr.Warning(t("messages.audio_save_fallback", requested=audio_format, fallback=actual_format, error=error_msg))
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(audio_params, f, indent=2, ensure_ascii=False)
+            audio_path = saved_audio_path
             audio_outputs[i] = audio_path
-            all_audio_paths.append(audio_path)
+            if audio_path:
+                all_audio_paths.append(audio_path)
             all_audio_paths.append(json_path)
             
             code_str = audio_params.get("audio_codes", "")

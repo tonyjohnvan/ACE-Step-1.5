@@ -202,6 +202,8 @@
     "no_audio_to_save": "❌ 保存するオーディオがありません",
     "save_success": "✅ オーディオとメタデータを {filename} に保存しました",
     "save_failed": "❌ 保存に失敗しました: {error}",
+    "audio_save_fallback": "⚠️ {requested}音声の保存に失敗したため、{fallback}として保存しました。エラー: {error}",
+    "audio_save_failed": "❌ 音声の保存に失敗しました: {error}",
     "no_file_selected": "⚠️ ファイルが選択されていません",
     "params_loaded": "✅ {filename} からパラメータを読み込みました",
     "invalid_json": "❌ 無効なJSONファイル: {error}",

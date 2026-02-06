@@ -202,6 +202,8 @@
     "no_audio_to_save": "❌ 没有要保存的音频",
     "save_success": "✅ 已将音频和元数据保存到 {filename}",
     "save_failed": "❌ 保存失败: {error}",
+    "audio_save_fallback": "⚠️ 无法保存{requested}音频，已改为{fallback}格式保存。错误: {error}",
+    "audio_save_failed": "❌ 保存音频失败: {error}",
     "no_file_selected": "⚠️ 未选择文件",
     "params_loaded": "✅ 已从 {filename} 加载参数",
     "invalid_json": "❌ 无效的JSON文件: {error}",

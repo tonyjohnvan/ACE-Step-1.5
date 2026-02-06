@@ -202,6 +202,8 @@
     "no_audio_to_save": "❌ No audio to save",
     "save_success": "✅ Saved audio and metadata to {filename}",
     "save_failed": "❌ Failed to save: {error}",
+    "audio_save_fallback": "⚠️ Failed to save {requested} audio, saved as {fallback} instead. Error: {error}",
+    "audio_save_failed": "❌ Failed to save audio: {error}",
     "no_file_selected": "⚠️ No file selected",
     "params_loaded": "✅ Parameters loaded from {filename}",
     "invalid_json": "❌ Invalid JSON file: {error}",
