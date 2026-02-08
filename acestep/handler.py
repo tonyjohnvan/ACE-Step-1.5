@@ -173,7 +173,7 @@ class AceStepHandler:
         
         # Check if model is quantized - LoRA loading on quantized models is not supported
         # due to incompatibility between PEFT and torchao (missing get_apply_tensor_subclass argument)
-        if hasattr(self, 'quantization') and self.quantization is not None:
+        if self.quantization is not None:
             return (
                 f"❌ LoRA loading is not supported on quantized models. "
                 f"Current quantization: {self.quantization}. "
