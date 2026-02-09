@@ -369,12 +369,18 @@ def generate_music(
 
         if config.seeds is not None:
             if isinstance(config.seeds, list) and len(config.seeds) > 0:
-                # Convert List[int] to comma-separated string
                 seed_for_generation = ",".join(str(s) for s in config.seeds)
             elif isinstance(config.seeds, int):
-                # Fix: Explicitly handle single integer seeds by converting to string.
-                # Previously, this would crash because 'len()' was called on an int.
                 seed_for_generation = str(config.seeds)
+        elif not config.use_random_seed and params.seed is not None:
+            try:
+                s = params.seed
+                if isinstance(s, (int, float)) and s >= 0:
+                    seed_for_generation = str(int(s))
+                elif isinstance(s, str) and s.strip() and s.strip() != "-1":
+                    seed_for_generation = s.strip()
+            except (TypeError, ValueError):
+                pass
 
         # Use dit_handler.prepare_seeds to handle seed list generation and padding
         # This will handle all the logic: padding with random seeds if needed, etc.

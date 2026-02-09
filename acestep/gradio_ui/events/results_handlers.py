@@ -531,14 +531,11 @@ def generate_with_progress(
         logger.info("[generate_with_progress] Skipping Phase 1 metas COT: sample is already formatted (is_format_caption=True)")
         gr.Info(t("messages.skipping_metas_cot"))
     
-    # Parse and validate custom timesteps
     parsed_timesteps, has_timesteps_warning, _ = parse_and_validate_timesteps(custom_timesteps, inference_steps)
-    
-    # Update inference_steps if custom timesteps provided (to match UI display)
-    actual_inference_steps = inference_steps
+    actual_inference_steps = int(inference_steps) if inference_steps is not None else 8
     if parsed_timesteps is not None:
         actual_inference_steps = len(parsed_timesteps) - 1
-    
+
     # step 1: prepare inputs
     # generate_music, GenerationParams, GenerationConfig
     gen_params = GenerationParams(
@@ -577,12 +574,19 @@ def generate_with_progress(
         use_cot_language=use_cot_language,
         use_constrained_decoding=True,
     )
-    # seed string to list
-    if isinstance(seed, str) and seed.strip():
+    if isinstance(seed, (int, float)):
+        seed_list = [int(seed)] if seed >= 0 else None
+    elif isinstance(seed, str) and seed.strip():
         if "," in seed:
-            seed_list = [int(s.strip()) for s in seed.split(",")]
+            try:
+                seed_list = [int(s.strip()) for s in seed.split(",")]
+            except (ValueError, TypeError):
+                seed_list = None
         else:
-            seed_list = [int(seed.strip())]
+            try:
+                seed_list = [int(seed.strip())]
+            except (ValueError, TypeError):
+                seed_list = None
     else:
         seed_list = None
     gen_config = GenerationConfig(
