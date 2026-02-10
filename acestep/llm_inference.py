@@ -2592,53 +2592,32 @@ class LLMHandler:
             logger.info(f"Loading MLX model from {model_path}")
             start_time = time.time()
 
-            # Try standard mlx-lm load first
-            try:
-                self._mlx_model, _ = mlx_load(model_path)
-            except Exception as first_err:
-                # The ACE-Step 5Hz LM checkpoints store safetensors keys without
-                # the "model." prefix (e.g. "layers.0.xxx" instead of
-                # "model.layers.0.xxx") which is what mlx-lm's Qwen3 model
-                # expects.  When the standard load fails we retry with the
-                # prefix remapped.
-                logger.info(
-                    f"Standard MLX load failed ({first_err}), "
-                    "retrying with 'model.' prefix remapping..."
-                )
-                import glob as _glob
-                from pathlib import Path
-                from mlx_lm.utils import load_model, load_config, load_tokenizer, _get_classes
+            # Pre-check: ACE-Step 5Hz LM checkpoints store safetensors keys
+            # without the "model." prefix (e.g. "layers.0.xxx" instead of
+            # "model.layers.0.xxx") which is what mlx-lm's Qwen3 model expects.
+            # Detect this upfront to avoid a noisy failed mlx_load() attempt
+            # that would dump hundreds of mismatched parameter names to the log.
+            needs_prefix = self._mlx_weights_need_prefix(model_path, mx)
 
-                _model_path = Path(model_path)
-                config = load_config(_model_path)
-
-                # Load raw weights from safetensors
-                weight_files = _glob.glob(str(_model_path / "model*.safetensors"))
-                if not weight_files:
-                    raise FileNotFoundError(f"No safetensors found in {model_path}") from first_err
-
-                weights = {}
-                for wf in weight_files:
-                    weights.update(mx.load(wf))
-
-                # Check if keys need "model." prefix by inspecting first key
-                sample_key = next(iter(weights))
-                if not sample_key.startswith("model."):
-                    logger.info("Adding 'model.' prefix to weight keys for MLX compatibility")
-                    weights = {f"model.{k}": v for k, v in weights.items()}
-
-                # Build model from config
-                model_class, model_args_class = _get_classes(config=config)
-                model_args = model_args_class.from_dict(config)
-                model = model_class(model_args)
-
-                if hasattr(model, "sanitize"):
-                    weights = model.sanitize(weights)
-
-                model.load_weights(list(weights.items()), strict=True)
-                mx.eval(model.parameters())
-                model.eval()
-                self._mlx_model = model
+            if not needs_prefix:
+                # Keys already have correct prefix -- use standard mlx-lm load
+                try:
+                    self._mlx_model, _ = mlx_load(model_path)
+                except Exception as first_err:
+                    # Unexpected failure; truncate verbose errors and retry
+                    err_msg = str(first_err)
+                    if len(err_msg) > 200:
+                        err_msg = err_msg[:200] + f"... [{len(str(first_err))} chars total]"
+                    logger.info(
+                        f"Standard MLX load failed ({err_msg}), "
+                        "retrying with 'model.' prefix remapping..."
+                    )
+                    logger.debug(f"Full MLX load error: {first_err}")
+                    self._mlx_load_with_prefix_remap(model_path, mx)
+            else:
+                # Keys need 'model.' prefix -- skip standard load, go direct
+                logger.info("Checkpoint uses unprefixed weight keys; loading with 'model.' prefix remapping")
+                self._mlx_load_with_prefix_remap(model_path, mx)
 
             mx.eval(self._mlx_model.parameters())
             # Store model path for get_hf_model_for_scoring
@@ -2662,6 +2641,72 @@ class LLMHandler:
             error_detail = traceback.format_exc()
             logger.warning(f"Failed to load MLX model: {e}\n{error_detail}")
             return False, f"❌ MLX load failed: {str(e)}"
+
+    @staticmethod
+    def _mlx_weights_need_prefix(model_path: str, mx) -> bool:
+        """
+        Peek at the first safetensors key to check if weights need 'model.' prefix.
+
+        Returns True if the keys lack the 'model.' prefix (e.g. ACE-Step checkpoints),
+        False if they already have it or if we cannot determine.
+        """
+        import glob as _glob
+        from pathlib import Path
+
+        weight_files = _glob.glob(str(Path(model_path) / "model*.safetensors"))
+        if not weight_files:
+            return False  # No safetensors found; let standard load report the error
+
+        try:
+            first_weights = mx.load(weight_files[0])
+            sample_key = next(iter(first_weights))
+            return not sample_key.startswith("model.")
+        except Exception:
+            return False  # Cannot determine; let standard load handle it
+
+    def _mlx_load_with_prefix_remap(self, model_path: str, mx) -> None:
+        """
+        Load MLX model with 'model.' prefix added to weight keys.
+
+        ACE-Step 5Hz LM checkpoints use unprefixed keys (e.g. "layers.0.xxx")
+        while mlx-lm's Qwen3 model class expects "model.layers.0.xxx".
+        This method manually loads the weights, remaps the keys, and builds
+        the model.
+        """
+        import glob as _glob
+        from pathlib import Path
+        from mlx_lm.utils import load_config, _get_classes
+
+        _model_path = Path(model_path)
+        config = load_config(_model_path)
+
+        # Load raw weights from safetensors
+        weight_files = _glob.glob(str(_model_path / "model*.safetensors"))
+        if not weight_files:
+            raise FileNotFoundError(f"No safetensors found in {model_path}")
+
+        weights = {}
+        for wf in weight_files:
+            weights.update(mx.load(wf))
+
+        # Add "model." prefix if needed
+        sample_key = next(iter(weights))
+        if not sample_key.startswith("model."):
+            logger.info("Adding 'model.' prefix to weight keys for MLX compatibility")
+            weights = {f"model.{k}": v for k, v in weights.items()}
+
+        # Build model from config
+        model_class, model_args_class = _get_classes(config=config)
+        model_args = model_args_class.from_dict(config)
+        model = model_class(model_args)
+
+        if hasattr(model, "sanitize"):
+            weights = model.sanitize(weights)
+
+        model.load_weights(list(weights.items()), strict=True)
+        mx.eval(model.parameters())
+        model.eval()
+        self._mlx_model = model
 
     def _make_mlx_cache(self):
         """Create a KV cache for the MLX model."""
