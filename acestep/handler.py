@@ -87,6 +87,9 @@ class AceStepHandler:
         self.current_offload_cost = 0.0
         self.disable_tqdm = os.environ.get("ACESTEP_DISABLE_TQDM", "").lower() in ("1", "true", "yes") or not getattr(sys.stderr, 'isatty', lambda: False)()
         self.debug_stats = os.environ.get("ACESTEP_DEBUG_STATS", "").lower() in ("1", "true", "yes")
+        # Adaptive MPS VAE decode: probed at runtime, cached for the session.
+        # None = not yet probed; (chunk, overlap) = largest safe sizes found.
+        self._mps_safe_decode_params: Optional[tuple] = None
         self._last_diffusion_per_step_sec: Optional[float] = None
         self._progress_estimates_lock = threading.Lock()
         self._progress_estimates = {"records": []}
@@ -2906,14 +2909,19 @@ class AceStepHandler:
         
         return outputs
 
-    # MPS-safe chunk parameters (class-level for testability)
-    _MPS_DECODE_CHUNK_SIZE = 32
-    _MPS_DECODE_OVERLAP = 8
+    # Absolute minimum chunk before giving up on MPS and falling back to CPU.
+    _MPS_MIN_CHUNK_SIZE = 16
 
     def tiled_decode(self, latents, chunk_size: Optional[int] = None, overlap: int = 64, offload_wav_to_cpu: Optional[bool] = None):
         """
         Decode latents using tiling to reduce VRAM usage.
         Uses overlap-discard strategy to avoid boundary artifacts.
+        
+        On MPS the first call probes the device: if the auto-tuned chunk_size
+        works, it is cached and reused.  If it fails (MPS Conv1d output-size
+        limit), we progressively halve the chunk_size to find the largest
+        size that works on *this* device, cache it, and use it for all
+        subsequent calls.  No hardcoded fallback — purely hardware-adaptive.
         
         Args:
             latents: [Batch, Channels, Length]
@@ -2926,37 +2934,61 @@ class AceStepHandler:
         if offload_wav_to_cpu is None:
             offload_wav_to_cpu = self._should_offload_wav_to_cpu()
         
-        # MPS Conv1d has a hard output-size limit that the OobleckDecoder
-        # exceeds during temporal upsampling with large chunks.  Reduce
-        # chunk_size to keep each VAE decode within the MPS kernel limits
-        # while keeping computation on the fast MPS accelerator.
         _is_mps = (self.device == "mps")
-        if _is_mps:
-            _mps_chunk = self._MPS_DECODE_CHUNK_SIZE
-            _mps_overlap = self._MPS_DECODE_OVERLAP
-            _needs_reduction = (chunk_size > _mps_chunk) or (overlap > _mps_overlap)
-            if _needs_reduction:
-                logger.warning(
-                    f"[tiled_decode] MPS device detected; reducing chunk_size from {chunk_size} "
-                    f"to {min(chunk_size, _mps_chunk)} and overlap from {overlap} "
-                    f"to {min(overlap, _mps_overlap)} to avoid MPS conv output limit."
-                )
-                chunk_size = min(chunk_size, _mps_chunk)
-                overlap = min(overlap, _mps_overlap)
+
+        # If we already probed this MPS device, apply the cached safe sizes.
+        if _is_mps and self._mps_safe_decode_params is not None:
+            safe_chunk, safe_overlap = self._mps_safe_decode_params
+            chunk_size = min(chunk_size, safe_chunk)
+            overlap = min(overlap, safe_overlap)
         
         try:
-            return self._tiled_decode_inner(latents, chunk_size, overlap, offload_wav_to_cpu)
+            result = self._tiled_decode_inner(latents, chunk_size, overlap, offload_wav_to_cpu)
+            # First successful MPS decode — cache these params as safe.
+            if _is_mps and self._mps_safe_decode_params is None:
+                self._mps_safe_decode_params = (chunk_size, overlap)
+                logger.info(
+                    f"[tiled_decode] MPS VAE decode succeeded "
+                    f"(chunk_size={chunk_size}, overlap={overlap}). Cached."
+                )
+            return result
         except (NotImplementedError, RuntimeError) as exc:
             if not _is_mps:
-                raise  # only catch MPS-related errors
-            # Safety fallback: if the MPS tiled path still fails (e.g. very
-            # short latent that went through direct decode, or a future PyTorch
-            # MPS regression), transparently retry on CPU.
+                raise  # non-MPS errors propagate unchanged
+            # MPS failed — progressively find the largest working chunk_size.
             logger.warning(
-                f"[tiled_decode] MPS decode failed ({type(exc).__name__}: {exc}), "
-                f"falling back to CPU VAE decode..."
+                f"[tiled_decode] MPS VAE decode failed with chunk_size={chunk_size} "
+                f"({type(exc).__name__}: {exc}). Searching for safe chunk size..."
             )
-            return self._tiled_decode_cpu_fallback(latents)
+            return self._mps_find_safe_chunk(latents, chunk_size, offload_wav_to_cpu)
+
+    def _mps_find_safe_chunk(self, latents, failed_chunk_size, offload_wav_to_cpu):
+        """Progressively halve chunk_size to find the largest one that works
+        on this MPS device, then cache it for all future calls."""
+        chunk_size = failed_chunk_size // 2
+        while chunk_size >= self._MPS_MIN_CHUNK_SIZE:
+            # Scale overlap proportionally (quarter of chunk, minimum 2)
+            overlap = max(chunk_size // 4, 2)
+            logger.info(
+                f"[tiled_decode] MPS: trying chunk_size={chunk_size}, overlap={overlap} ..."
+            )
+            try:
+                result = self._tiled_decode_inner(latents, chunk_size, overlap, offload_wav_to_cpu)
+                # Found the largest safe size — cache it.
+                self._mps_safe_decode_params = (chunk_size, overlap)
+                logger.info(
+                    f"[tiled_decode] MPS: chunk_size={chunk_size} works on this device. "
+                    f"Cached for future calls."
+                )
+                return result
+            except (NotImplementedError, RuntimeError):
+                chunk_size //= 2
+
+        # All sizes exhausted — last resort CPU fallback.
+        logger.warning(
+            "[tiled_decode] MPS: no safe chunk_size found, falling back to CPU VAE decode."
+        )
+        return self._tiled_decode_cpu_fallback(latents)
 
     def _tiled_decode_cpu_fallback(self, latents):
         """Last-resort CPU VAE decode when MPS fails unexpectedly."""
