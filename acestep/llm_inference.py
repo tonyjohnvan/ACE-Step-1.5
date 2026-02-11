@@ -25,6 +25,10 @@ from acestep.constrained_logits_processor import MetadataConstrainedLogitsProces
 from acestep.constants import DEFAULT_LM_INSTRUCTION, DEFAULT_LM_UNDERSTAND_INSTRUCTION, DEFAULT_LM_INSPIRED_INSTRUCTION, DEFAULT_LM_REWRITE_INSTRUCTION
 from acestep.gpu_config import get_lm_gpu_memory_ratio, get_gpu_memory_gb, get_lm_model_size, get_global_gpu_config
 
+# VRAM thresholds for skipping vLLM/CUDA graphs on 16GB GPUs to avoid OOM/fragmentation
+VRAM_SAFE_TOTAL_GB = 16.0
+VRAM_SAFE_FREE_GB = 2.0
+
 
 def _warn_if_prerelease_python():
     v = sys.version_info
@@ -463,7 +467,12 @@ class LLMHandler:
             full_lm_model_path = os.path.join(checkpoint_dir, lm_model_path)
             if not os.path.exists(full_lm_model_path):
                 return f"❌ 5Hz LM model not found at {full_lm_model_path}", False
-            
+
+            # Proactive CUDA cleanup before LM load to reduce fragmentation on mode/model switch
+            if device == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
             logger.info("loading 5Hz LM tokenizer... it may take 80~90s")
             start_time = time.time()
             # TODO: load tokenizer too slow, not found solution yet
@@ -530,30 +539,46 @@ class LLMHandler:
             # Initialize based on user-selected backend
             if backend == "vllm":
                 _warn_if_prerelease_python()
-                status_msg = self._initialize_5hz_lm_vllm(
-                    full_lm_model_path,
-                    enforce_eager=enforce_eager_for_vllm,
-                )
-                logger.info(f"5Hz LM status message: {status_msg}")
-                # Check if initialization failed (status_msg starts with ❌)
-                if status_msg.startswith("❌"):
-                    # vllm initialization failed
-                    if not self.llm_initialized:
-                        # On Apple Silicon, try MLX before falling back to PyTorch
-                        if device == "mps" and self._is_mlx_available():
-                            logger.warning("vllm failed on MPS, trying MLX backend...")
-                            mlx_success, mlx_status = self._load_mlx_model(full_lm_model_path)
-                            if mlx_success:
-                                return mlx_status, True
-                            logger.warning(f"MLX also failed: {mlx_status}, falling back to PyTorch")
-                        logger.warning("Falling back to PyTorch backend")
-                        success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
-                        if not success:
-                            return status_msg, False
-                        status_msg = f"✅ 5Hz LM initialized successfully (PyTorch fallback)\nModel: {full_lm_model_path}\nBackend: PyTorch"
-                # If vllm initialization succeeded, self.llm_initialized should already be True
+                total_gb = get_gpu_memory_gb() if device == "cuda" else 0.0
+                free_gb = 0.0
+                if device == "cuda" and torch.cuda.is_available():
+                    try:
+                        if hasattr(torch.cuda, "mem_get_info"):
+                            free_bytes, _ = torch.cuda.mem_get_info()
+                            free_gb = free_bytes / (1024**3)
+                        else:
+                            total_bytes = torch.cuda.get_device_properties(0).total_memory
+                            free_gb = (total_bytes - torch.cuda.memory_reserved(0)) / (1024**3)
+                    except Exception:
+                        free_gb = 0.0
+                if device == "cuda" and (total_gb <= VRAM_SAFE_TOTAL_GB or free_gb < VRAM_SAFE_FREE_GB):
+                    logger.warning(
+                        f"vLLM disabled due to VRAM safety constraints (total={total_gb:.2f}GB, free={free_gb:.2f}GB) — falling back to PyTorch backend"
+                    )
+                    success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
+                    if not success:
+                        return status_msg, False
+                    status_msg = f"✅ 5Hz LM initialized successfully (PyTorch fallback)\nModel: {full_lm_model_path}\nBackend: PyTorch"
+                else:
+                    status_msg = self._initialize_5hz_lm_vllm(
+                        full_lm_model_path,
+                        enforce_eager=enforce_eager_for_vllm,
+                    )
+                    logger.info(f"5Hz LM status message: {status_msg}")
+                    if status_msg.startswith("❌"):
+                        if not self.llm_initialized:
+                            if device == "mps" and self._is_mlx_available():
+                                logger.warning("vllm failed on MPS, trying MLX backend...")
+                                mlx_success, mlx_status = self._load_mlx_model(full_lm_model_path)
+                                if mlx_success:
+                                    return mlx_status, True
+                                logger.warning(f"MLX also failed: {mlx_status}, falling back to PyTorch")
+                            logger.warning("Falling back to PyTorch backend")
+                            success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
+                            if not success:
+                                return status_msg, False
+                            status_msg = f"✅ 5Hz LM initialized successfully (PyTorch fallback)\nModel: {full_lm_model_path}\nBackend: PyTorch"
             elif backend != "mlx":
-                # Use PyTorch backend (pt) - "mlx" case already handled above
                 success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
                 if not success:
                     return status_msg, False
