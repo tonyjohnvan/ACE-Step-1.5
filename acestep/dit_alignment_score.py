@@ -834,9 +834,16 @@ class MusicLyricScorer:
         Returns:
             AlignmentScore object containing individual metrics and final score.
         """
-        # Ensure Inputs are Tensors on the correct device
+        # Ensure Inputs are Tensors.
+        # Always compute on CPU — the scoring matrices are small and this
+        # avoids occupying GPU VRAM that DiT / VAE / LM need.  Keeping
+        # everything on CPU also prevents timeout issues on low-VRAM GPUs
+        # where the accelerator memory is fully committed to model weights.
+        _score_device = "cpu"
         if not isinstance(energy_matrix, torch.Tensor):
-            energy_matrix = torch.tensor(energy_matrix, device='cuda', dtype=torch.float32)
+            energy_matrix = torch.tensor(energy_matrix, device=_score_device, dtype=torch.float32)
+        else:
+            energy_matrix = energy_matrix.to(device=_score_device, dtype=torch.float32)
 
         device = energy_matrix.device
 

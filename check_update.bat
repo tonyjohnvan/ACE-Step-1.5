@@ -101,30 +101,31 @@ set FETCH_SUCCESS=0
 "!GIT_PATH!" fetch origin --quiet 2>nul
 if %ERRORLEVEL% EQU 0 (
     set FETCH_SUCCESS=1
-) else (
-    REM Try with timeout using a temp marker file
-    set TEMP_MARKER=%TEMP%\acestep_git_fetch_%RANDOM%.tmp
-
-    REM Start fetch in background
-    set "FETCH_CMD=!GIT_PATH! fetch origin --quiet"
-    start /b "" cmd /c "!FETCH_CMD! >nul 2>&1 && echo SUCCESS > "!TEMP_MARKER!""
-
-    REM Wait with timeout
-    set /a COUNTER=0
-    :WaitLoop
-    if exist "!TEMP_MARKER!" (
-        set FETCH_SUCCESS=1
-        del "!TEMP_MARKER!" >nul 2>&1
-        goto :FetchDone
-    )
-
-    timeout /t 1 /nobreak >nul
-    set /a COUNTER+=1
-    if !COUNTER! LSS %TIMEOUT_SECONDS% goto :WaitLoop
-
-    REM Timeout reached
-    echo   [Timeout] Could not connect to GitHub within %TIMEOUT_SECONDS% seconds.
 )
+if !FETCH_SUCCESS! EQU 1 goto :FetchDone
+
+REM Try with timeout using a temp marker file
+set TEMP_MARKER=%TEMP%\acestep_git_fetch_%RANDOM%.tmp
+
+REM Start fetch in background
+set "FETCH_CMD=!GIT_PATH! fetch origin --quiet"
+start /b "" cmd /c "!FETCH_CMD! >nul 2>&1 && echo SUCCESS > "!TEMP_MARKER!""
+
+REM Wait with timeout
+set /a COUNTER=0
+:WaitLoop
+if exist "!TEMP_MARKER!" (
+    set FETCH_SUCCESS=1
+    del "!TEMP_MARKER!" >nul 2>&1
+    goto :FetchDone
+)
+
+timeout /t 1 /nobreak >nul
+set /a COUNTER+=1
+if !COUNTER! LSS %TIMEOUT_SECONDS% goto :WaitLoop
+
+REM Timeout reached
+echo   [Timeout] Could not connect to GitHub within %TIMEOUT_SECONDS% seconds.
 
 :FetchDone
 if %FETCH_SUCCESS% EQU 0 (
@@ -215,10 +216,13 @@ if "%REMOTE_COMMIT%"=="" (
         )
     ) else (
         echo.
-        echo   Continuing with current branch comparison...
-        echo   Note: This comparison may not reflect official updates.
+        echo   Staying on branch '%CURRENT_BRANCH%'. No update performed.
         echo.
-        set CURRENT_BRANCH=!FALLBACK_BRANCH!
+        echo ========================================
+        echo Press any key to close...
+        echo ========================================
+        pause >nul
+        exit /b 0
     )
 )
 
@@ -247,7 +251,7 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
 
         REM Show commits behind
         echo   New commits:
-        "!GIT_PATH!" log --oneline --graph --decorate HEAD..origin/%CURRENT_BRANCH% 2>nul
+        "!GIT_PATH!" --no-pager log --oneline --graph --decorate HEAD..origin/%CURRENT_BRANCH% 2>nul
         echo.
 
         REM Ask if user wants to update
@@ -255,6 +259,9 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
         if /i "!UPDATE_CHOICE!"=="Y" (
             echo.
             echo Updating...
+
+            REM First, refresh the index to avoid false positives from line ending changes
+            "!GIT_PATH!" update-index --refresh >nul 2>&1
 
             REM Check for uncommitted changes
             "!GIT_PATH!" diff-index --quiet HEAD -- 2>nul
@@ -331,12 +338,8 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
 
                     if /i "!CONFLICT_CHOICE!"=="Y" (
                         echo.
-                        echo [Restore] Restoring conflicting files to remote version...
-
-                        REM Restore files to HEAD (discard local changes)
-                        "!GIT_PATH!" reset --hard HEAD >nul 2>&1
-
-                        echo [Restore] Files restored. Proceeding with update...
+                        echo [Restore] Proceeding with update...
+                        echo [Restore] Files will be updated to remote version.
                     ) else (
                         echo.
                         echo Update cancelled.
@@ -369,9 +372,79 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                 )
             )
 
+            REM Check for untracked files that could be overwritten
+            set STASHED_UNTRACKED=0
+            set TEMP_UNTRACKED=%TEMP%\acestep_untracked_%RANDOM%.txt
+            "!GIT_PATH!" ls-files --others --exclude-standard 2>nul > "!TEMP_UNTRACKED!"
+
+            REM Check if there are any untracked files
+            set HAS_UNTRACKED=0
+            for /f "usebackq delims=" %%u in ("!TEMP_UNTRACKED!") do set HAS_UNTRACKED=1
+
+            if !HAS_UNTRACKED! EQU 1 (
+                REM Get files added in remote
+                set TEMP_REMOTE_ADDED=%TEMP%\acestep_remote_added_%RANDOM%.txt
+                "!GIT_PATH!" diff --name-only --diff-filter=A HEAD..origin/%CURRENT_BRANCH% 2>nul > "!TEMP_REMOTE_ADDED!"
+
+                set HAS_UNTRACKED_CONFLICTS=0
+                for /f "usebackq delims=" %%u in ("!TEMP_UNTRACKED!") do (
+                    findstr /x /c:"%%u" "!TEMP_REMOTE_ADDED!" >nul 2>&1
+                    if !ERRORLEVEL! EQU 0 (
+                        if !HAS_UNTRACKED_CONFLICTS! EQU 0 (
+                            echo.
+                            echo ========================================
+                            echo [Warning] Untracked files conflict with update!
+                            echo ========================================
+                            echo.
+                            echo The following untracked files would be overwritten:
+                        )
+                        set HAS_UNTRACKED_CONFLICTS=1
+                        echo   %%u
+                    )
+                )
+
+                del "!TEMP_REMOTE_ADDED!" >nul 2>&1
+
+                if !HAS_UNTRACKED_CONFLICTS! EQU 1 (
+                    echo.
+                    set /p STASH_UNTRACKED_CHOICE="Stash untracked files before updating? (Y/N): "
+                    if /i "!STASH_UNTRACKED_CHOICE!"=="Y" (
+                        echo Stashing all changes including untracked files...
+                        "!GIT_PATH!" stash push --include-untracked -m "pre-update-%RANDOM%" >nul 2>&1
+                        if !ERRORLEVEL! EQU 0 (
+                            set STASHED_UNTRACKED=1
+                            echo [Stash] Changes stashed successfully.
+                        ) else (
+                            echo [Error] Failed to stash changes. Update aborted.
+                            del "!TEMP_UNTRACKED!" >nul 2>&1
+                            echo.
+                            echo ========================================
+                            echo Press any key to close...
+                            echo ========================================
+                            pause >nul
+                            exit /b 1
+                        )
+                    ) else (
+                        echo.
+                        echo Update cancelled. Please move or remove the conflicting files manually.
+                        del "!TEMP_UNTRACKED!" >nul 2>&1
+                        echo.
+                        echo ========================================
+                        echo Press any key to close...
+                        echo ========================================
+                        pause >nul
+                        exit /b 1
+                    )
+                    echo.
+                )
+            )
+
+            del "!TEMP_UNTRACKED!" >nul 2>&1
+
             REM Pull changes
             echo Pulling latest changes...
-            "!GIT_PATH!" pull origin %CURRENT_BRANCH%
+            REM Force update by resetting to remote branch (discards any remaining local changes)
+            "!GIT_PATH!" reset --hard origin/%CURRENT_BRANCH% >nul 2>&1
 
             if !ERRORLEVEL! EQU 0 (
                 echo.
@@ -402,6 +475,16 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                     )
                 )
 
+                if !STASHED_UNTRACKED! EQU 1 (
+                    echo [Stash] Untracked files were stashed before the update.
+                    echo   To restore them:  git stash pop
+                    echo   To discard them:  git stash drop
+                    echo.
+                    echo   Note: 'git stash pop' may produce merge conflicts if
+                    echo   the update modified the same files. Resolve manually.
+                    echo.
+                )
+
                 echo Please restart the application to use the new version.
                 echo.
                 echo ========================================
@@ -413,6 +496,17 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                 echo.
                 echo [Error] Update failed.
                 echo Please check the error messages above.
+
+                if !STASHED_UNTRACKED! EQU 1 (
+                    echo.
+                    echo [Stash] Restoring stashed changes...
+                    "!GIT_PATH!" stash pop >nul 2>&1
+                    if !ERRORLEVEL! EQU 0 (
+                        echo [Stash] Changes restored successfully.
+                    ) else (
+                        echo [Stash] Could not auto-restore. Run 'git stash pop' manually.
+                    )
+                )
 
                 REM If backup exists, mention it
                 if defined BACKUP_DIR (

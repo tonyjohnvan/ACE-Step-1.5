@@ -7,13 +7,13 @@ requires-python = "==3.11.*"
 license = {text = "MIT"}
 dependencies = [
     # PyTorch for Windows with CUDA 12.8
-    "torch==2.7.1; sys_platform == 'win32'",
-    "torchvision; sys_platform == 'win32'",
-    "torchaudio==2.7.1; sys_platform == 'win32'",
+    "torch==2.7.1+cu128; sys_platform == 'win32'",
+    "torchvision==0.22.1+cu128; sys_platform == 'win32'",
+    "torchaudio==2.7.1+cu128; sys_platform == 'win32'",
     # PyTorch for Linux with CUDA 12.8
-    "torch==2.10.0; sys_platform == 'linux'",
-    "torchvision; sys_platform == 'linux'",
-    "torchaudio==2.10.0; sys_platform == 'linux'",
+    "torch==2.10.0+cu128; sys_platform == 'linux'",
+    "torchvision==0.25.0+cu128; sys_platform == 'linux'",
+    "torchaudio==2.10.0+cu128; sys_platform == 'linux'",
     # PyTorch for macOS (CPU / MPS)
     "torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "torchvision; sys_platform == 'darwin' and platform_machine == 'arm64'",
@@ -21,7 +21,7 @@ dependencies = [
     # Common dependencies
     "transformers>=4.51.0,<4.58.0",
     "diffusers",
-    "gradio>=6.5.1",
+    "gradio==6.2.0",
     "matplotlib>=3.7.5",
     "scipy>=1.10.1",
     "soundfile>=0.13.1",
@@ -33,14 +33,22 @@ dependencies = [
     "uvicorn[standard]>=0.27.0",
     "numba>=0.63.1",
     "vector-quantize-pytorch>=1.27.15",
-    "torchcodec>=0.9.1; sys_platform != 'darwin'",
-    "torchao",
+    "torchcodec>=0.9.1",
+    "torchao>=0.14.1,<0.16.0",
+    "toml",
+    # MLX dependencies (Apple Silicon native acceleration - macOS only)
+    "mlx>=0.25.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     # Training dependencies
-    "peft>=0.7.0",
+    "peft>=0.18.0",
     "lightning>=2.0.0",
+    "tensorboard>=2.0.0",
     # Local third-party packages
-    "nano-vllm; sys_platform != 'darwin'",
-    "modelscope"
+    # nano-vllm source is configured in [tool.uv.sources]
+    "nano-vllm; sys_platform != 'darwin' or platform_machine != 'arm64'",
+    "modelscope",
+    "tensorboard>=2.20.0",
+    "typer-slim>=0.21.1",
 ]
 
 [[tool.uv.index]]
@@ -51,8 +59,6 @@ explicit = true
 [tool.uv]
 required-environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
 
 [tool.uv.sources]

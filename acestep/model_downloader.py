@@ -30,12 +30,15 @@ def _can_access_google(timeout: float = 3.0) -> bool:
         True if Google is accessible, False otherwise
     """
     import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("www.google.com", 443))
+        sock.settimeout(timeout)
+        sock.connect(("www.google.com", 443))
         return True
     except (socket.timeout, socket.error, OSError):
         return False
+    finally:
+        sock.close()
 
 
 def _download_from_huggingface_internal(
@@ -212,7 +215,9 @@ def check_main_model_exists(checkpoints_dir: Optional[Path] = None) -> bool:
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
-    
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
+
     for component in MAIN_MODEL_COMPONENTS:
         component_path = checkpoints_dir / component
         if not component_path.exists():
@@ -231,9 +236,14 @@ def check_model_exists(model_name: str, checkpoints_dir: Optional[Path] = None) 
     Returns:
         True if the model exists, False otherwise.
     """
+    if not model_name:
+        logger.warning("[check_model_exists] Empty model_name; treating as missing.")
+        return False
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
-    
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
+
     model_path = checkpoints_dir / model_name
     return model_path.exists()
 
@@ -278,6 +288,8 @@ def download_main_model(
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     # Ensure checkpoints directory exists
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +331,8 @@ def download_submodel(
 
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     # Ensure checkpoints directory exists
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -355,7 +369,9 @@ def download_all_models(
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
-    
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
+
     messages = []
     all_success = True
     
@@ -430,6 +446,8 @@ def ensure_lm_model(
 
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     if check_model_exists(model_name, checkpoints_dir):
         return True, f"LM model '{model_name}' is available"
@@ -471,6 +489,8 @@ def ensure_dit_model(
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     if check_model_exists(model_name, checkpoints_dir):
         return True, f"DiT model '{model_name}' is available"
@@ -486,6 +506,8 @@ def ensure_dit_model(
         print("=" * 60 + "\n")
         return download_submodel(model_name, checkpoints_dir, token=token, prefer_source=prefer_source)
 
+    if not model_name:
+        return False, "Unknown DiT model: '' (pass None for default or choose a valid model)"
     return False, f"Unknown DiT model: {model_name}"
 
 

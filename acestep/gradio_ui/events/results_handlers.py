@@ -5,11 +5,7 @@ Contains event handlers and helper functions related to result display, scoring,
 import os
 import json
 import datetime
-import math
 import re
-import tempfile
-import shutil
-import zipfile
 import time as time_module
 import sys
 from typing import Dict, Any, Optional, List
@@ -25,13 +21,18 @@ from acestep.gpu_config import (
     check_batch_size_limit,
 )
 
-# Platform detection for Windows-specific fixes
+# Platform detection for Windows-specific fixess
 IS_WINDOWS = sys.platform == "win32"
 
 # Global results directory inside project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 DEFAULT_RESULTS_DIR = os.path.join(PROJECT_ROOT, "gradio_outputs").replace("\\", "/")
 os.makedirs(DEFAULT_RESULTS_DIR, exist_ok=True)
+
+
+def clear_audio_outputs_for_new_generation():
+    """Return None for all 9 audio outputs so Gradio clears them and stops playback when a new generation starts."""
+    return (None,) * 9
 
 
 def parse_lrc_to_subtitles(lrc_text: str, total_duration: Optional[float] = None) -> List[Dict[str, Any]]:
@@ -449,18 +450,19 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
     
     This function ONLY sets the src_audio field. All other metadata fields (caption, lyrics, etc.)
     are preserved by returning gr.skip() to avoid overwriting user's existing inputs.
+    Also opens the audio_uploads_accordion so the user can see the uploaded audio.
     
     Args:
         audio_file: Audio file path
         lm_metadata: Dictionary containing LM-generated metadata (unused, kept for API compatibility)
         
     Returns:
-        Tuple of (audio_file, bpm, caption, lyrics, duration, key_scale, language, time_signature, is_format_caption)
-        All values except audio_file are gr.skip() to preserve existing UI values
+        Tuple of (audio_file, bpm, caption, lyrics, duration, key_scale, language, time_signature, is_format_caption, audio_uploads_accordion)
+        All values except audio_file and audio_uploads_accordion are gr.skip() to preserve existing UI values
     """
     if audio_file is None:
         # Return all skip to not modify anything
-        return (gr.skip(),) * 9
+        return (gr.skip(),) * 10
     
     # Only set the audio file, skip all other fields to preserve existing values
     # This ensures user's caption, lyrics, bpm, etc. are NOT cleared
@@ -474,6 +476,7 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
         gr.skip(),       # language - preserve existing value
         gr.skip(),       # time_signature - preserve existing value
         gr.skip(),       # is_format_caption - preserve existing value
+        gr.Accordion(open=True),  # audio_uploads_accordion - expand to show uploaded audio
     )
 
 
@@ -530,14 +533,11 @@ def generate_with_progress(
         logger.info("[generate_with_progress] Skipping Phase 1 metas COT: sample is already formatted (is_format_caption=True)")
         gr.Info(t("messages.skipping_metas_cot"))
     
-    # Parse and validate custom timesteps
     parsed_timesteps, has_timesteps_warning, _ = parse_and_validate_timesteps(custom_timesteps, inference_steps)
-    
-    # Update inference_steps if custom timesteps provided (to match UI display)
-    actual_inference_steps = inference_steps
+    actual_inference_steps = int(inference_steps) if inference_steps is not None else 8
     if parsed_timesteps is not None:
         actual_inference_steps = len(parsed_timesteps) - 1
-    
+
     # step 1: prepare inputs
     # generate_music, GenerationParams, GenerationConfig
     gen_params = GenerationParams(
@@ -576,12 +576,19 @@ def generate_with_progress(
         use_cot_language=use_cot_language,
         use_constrained_decoding=True,
     )
-    # seed string to list
-    if isinstance(seed, str) and seed.strip():
+    if isinstance(seed, (int, float)):
+        seed_list = [int(seed)] if seed >= 0 else None
+    elif isinstance(seed, str) and seed.strip():
         if "," in seed:
-            seed_list = [int(s.strip()) for s in seed.split(",")]
+            try:
+                seed_list = [int(s.strip()) for s in seed.split(",")]
+            except (ValueError, TypeError):
+                seed_list = None
         else:
-            seed_list = [int(seed.strip())]
+            try:
+                seed_list = [int(seed.strip())]
+            except (ValueError, TypeError):
+                seed_list = None
     else:
         seed_list = None
     gen_config = GenerationConfig(
@@ -690,25 +697,29 @@ def generate_with_progress(
     )
     time_module.sleep(0.1)
     
+    final_codes_display_updates = [gr.skip() for _ in range(8)]
     for i in range(8):
         if i < len(audios):
             key = audios[i]["key"]
             audio_tensor = audios[i]["tensor"]
             sample_rate = audios[i]["sample_rate"]
             audio_params = audios[i]["params"]
-            # Use local output directory instead of system temp
+            is_silent = audios[i].get("silent", False)
             timestamp = int(time_module.time())
             temp_dir = os.path.join(DEFAULT_RESULTS_DIR, f"batch_{timestamp}")
             temp_dir = os.path.abspath(temp_dir).replace("\\", "/")
             os.makedirs(temp_dir, exist_ok=True)
             json_path = os.path.join(temp_dir, f"{key}.json").replace("\\", "/")
             audio_path = os.path.join(temp_dir, f"{key}.{audio_format}").replace("\\", "/")
-            save_audio(audio_data=audio_tensor, output_path=audio_path, sample_rate=sample_rate, format=audio_format, channels_first=True)
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(audio_params, f, indent=2, ensure_ascii=False)
-            audio_outputs[i] = audio_path
-            all_audio_paths.append(audio_path)
-            all_audio_paths.append(json_path)
+            if not is_silent and audio_tensor is not None:
+                save_audio(audio_data=audio_tensor, output_path=audio_path, sample_rate=sample_rate, format=audio_format, channels_first=True)
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(audio_params, f, indent=2, ensure_ascii=False)
+                audio_outputs[i] = audio_path
+                all_audio_paths.append(audio_path)
+                all_audio_paths.append(json_path)
+            else:
+                audio_outputs[i] = None
             
             code_str = audio_params.get("audio_codes", "")
             final_codes_list[i] = code_str
@@ -821,6 +832,7 @@ def generate_with_progress(
             
             codes_display_updates = [gr.skip() for _ in range(8)]
             codes_display_updates[i] = gr.update(value=code_str, visible=True)  # Keep visible=True
+            final_codes_display_updates[i] = gr.update(value=code_str, visible=True)  # Keep visible=True
             
             details_accordion_updates = [gr.skip() for _ in range(8)]
             # Don't change accordion visibility - keep it always expandable
@@ -918,24 +930,15 @@ def generate_with_progress(
     )
     
     # Build final codes display, LRC display, accordion visibility updates
-    final_codes_display_updates = [gr.skip() for _ in range(8)]
     # final_lrc_display_updates = [gr.skip() for _ in range(8)]
     final_accordion_updates = [gr.skip() for _ in range(8)]
 
-    # On Windows, progressive yields are disabled, so we must return actual audio paths
-    # On other platforms, audio was already sent in loop yields, just reset playback position
-    # Use gr.update() to force Gradio to update the audio component (Issue #113)
-    audio_playback_updates = []
-    for idx in range(8):
-        path = audio_outputs[idx]
-        if path:
-            audio_playback_updates.append(gr.update(value=path, label=f"Sample {idx+1} (Ready)", interactive=True))
-            logger.info(f"[generate_with_progress] Audio {idx+1} path: {path}")
-        else:
-            audio_playback_updates.append(gr.update(value=None, label="None", interactive=False))
+    # Audio was already sent in loop yields, just reset playback position to 0
+    # This resets the playback cursor to the beginning without reloading the audio
+    audio_playback_updates = [gr.update(playback_position=0) for _ in range(8)]
 
     yield (
-        # Audio outputs - use gr.update() to force component refresh
+        # Audio outputs - reset playback position to beginning
         audio_playback_updates[0], audio_playback_updates[1], audio_playback_updates[2], audio_playback_updates[3],
         audio_playback_updates[4], audio_playback_updates[5], audio_playback_updates[6], audio_playback_updates[7],
         all_audio_paths,
@@ -1289,8 +1292,7 @@ def generate_lrc_handler(dit_handler, sample_idx, current_batch_index, batch_que
         Tuple of (lrc_display_update, details_accordion_update, batch_queue)
         Note: No audio_update - subtitles updated via lrc_display.change()
     """
-    import torch
-    
+
     if current_batch_index not in batch_queue:
         return gr.skip(), gr.skip(), batch_queue
 
@@ -1507,6 +1509,11 @@ def generate_with_batch_management(
     """
     Wrapper for generate_with_progress that adds batch queue management
     """
+    # Reset batch state for this run so UI shows 1/1 and new audio (Issue #163)
+    current_batch_index = 0
+    total_batches = 1
+    batch_queue = {}
+
     # Call the original generation function
     generator = generate_with_progress(
         dit_handler, llm_handler,
@@ -1529,17 +1536,13 @@ def generate_with_batch_management(
     final_result_from_inner = None
     for partial_result in generator:
         final_result_from_inner = partial_result
-        # Progressive yields disabled on Windows to prevent UI freeze
-        # On other platforms, yield progress updates normally
-        if not IS_WINDOWS:
-            # current_batch_index, total_batches, batch_queue, next_params,
-            # batch_indicator_text, prev_btn, next_btn, next_status, restore_btn
-            # Slice off extra_outputs and raw_codes_list (last 2 items) before re-yielding to UI
-            ui_result = partial_result[:-2] if len(partial_result) > 47 else (partial_result[:-1] if len(partial_result) > 46 else partial_result)
-            yield ui_result + (
-                gr.skip(), gr.skip(), gr.skip(), gr.skip(),
-                gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
-            )
+        # Forward intermediate yields to UI for progressive streaming updates
+        # (audio outputs appear one-by-one as they are ready)
+        # Pad with gr.skip() for the extra batch management outputs
+        yield tuple(partial_result[:46]) + (
+            gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+            gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+        )
     result = final_result_from_inner
     all_audio_paths = result[8]
 
@@ -1668,19 +1671,21 @@ def generate_with_batch_management(
         next_batch_status_text = t("messages.autogen_enabled")
 
     # 4. Yield final result (includes Batch UI updates)
-    # Extract core 46 items from result (0-45)
+    # Extract core 46 items from result (0-45). Use fresh list/tuple refs so Gradio re-renders (Issue #163)
     # Structure: 0-7: audio, 8: all_audio_paths, 9: generation_info, 10: status, 11: seed,
     # 12-19: scores, 20-27: codes_display, 28-35: accordions, 36-43: lrc_display,
     # 44: lm_metadata, 45: is_format_caption
-    # (46: extra_outputs, 47: raw_codes_list are NOT included in UI yields)
-    ui_core = result[:46]
+    ui_core_list = list(result[:46])
+    if ui_core_list[8] is not None:
+        ui_core_list[8] = list(ui_core_list[8])  # Fresh list ref for all_audio_paths so UI updates
+    ui_core = tuple(ui_core_list)
 
     logger.info(f"[generate_with_batch_management] Final yield: {len(ui_core)} core + 9 state")
 
-    yield tuple(ui_core) + (
+    yield ui_core + (
         current_batch_index,
         total_batches,
-        batch_queue,
+        dict(batch_queue),  # New dict ref so Gradio sees state change
         next_params,
         batch_indicator_text,
         gr.update(interactive=can_go_previous),
@@ -2007,6 +2012,7 @@ def navigate_to_previous_batch(current_batch_index, batch_queue):
     for idx in range(8):
         if idx < len(real_audio_paths):
             audio_path = real_audio_paths[idx].replace("\\", "/")  # Normalize path
+            # Pass path directly; Gradio Audio component with type="filepath" expects a string path
             audio_updates.append(gr.update(value=audio_path))
         else:
             audio_updates.append(gr.update(value=None))
@@ -2130,6 +2136,7 @@ def navigate_to_next_batch(autogen_enabled, current_batch_index, total_batches, 
     for idx in range(8):
         if idx < len(real_audio_paths):
             audio_path = real_audio_paths[idx].replace("\\", "/")  # Normalize path
+            # Pass path directly; Gradio Audio component with type="filepath" expects a string path
             audio_updates.append(gr.update(value=audio_path))
         else:
             audio_updates.append(gr.update(value=None))

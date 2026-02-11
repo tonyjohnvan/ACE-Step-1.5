@@ -1,4 +1,25 @@
 
+"""
+Constrained Logits Processor for ACE-Step Language Model
+
+This module implements a finite state machine (FSM) based logits processor that constrains
+the language model's output to follow specific formats and value ranges during music generation.
+
+Key Features:
+- Enforces structured metadata generation (BPM, duration, keyscale, etc.)
+- Validates numeric ranges (BPM: 30-300, Duration: 10-600s)
+- Ensures proper formatting for musical metadata
+- Prevents generation of invalid tokens or formats
+- Supports constrained audio code generation (0-63999)
+
+The FSM guides the model through different states to ensure outputs conform to expected
+schema requirements without post-processing corrections.
+
+Usage:
+    processor = ConstrainedLogitsProcessor(tokenizer, mode="metadata")
+    outputs = model.generate(inputs, logits_processor=[processor])
+"""
+
 from enum import Enum, auto
 from typing import Optional, Dict, Any, Tuple, List, Callable, Set
 from loguru import logger
@@ -553,7 +574,7 @@ class MetadataConstrainedLogitsProcessor(LogitsProcessor):
                 continue
         
         if invalid_tokens_count > 0:
-            logger.warning(f"Found {invalid_tokens_count} audio code tokens with values outside valid range [0, {MAX_AUDIO_CODE}]")
+            logger.debug(f"Found {invalid_tokens_count} audio code tokens with values outside valid range [0, {MAX_AUDIO_CODE}]")
         
         # Log warning if no valid tokens found (this would prevent code generation)
         if len(self.audio_code_token_ids) == 0:
