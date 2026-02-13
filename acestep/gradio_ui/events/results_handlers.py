@@ -420,31 +420,60 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
     )
 
 
-def send_audio_to_remix(audio_file, lm_metadata):
-    """Send generated audio to src_audio and switch mode to Remix.
+def _extract_metadata_for_editing(lm_metadata):
+    """Extract lyrics and caption from lm_metadata for repaint/remix operations.
+    
+    Args:
+        lm_metadata: Metadata dictionary from LM generation (or None)
     
     Returns:
-        Tuple of (src_audio, generation_mode)
+        Tuple of (lyrics, caption) as strings (empty strings if not found)
+    """
+    lyrics = ""
+    caption = ""
+    if lm_metadata and isinstance(lm_metadata, dict):
+        lyrics = lm_metadata.get("lyrics", "")
+        caption = lm_metadata.get("caption", "")
+    return lyrics, caption
+
+
+def send_audio_to_remix(audio_file, lm_metadata):
+    """Send generated audio to src_audio and switch mode to Remix.
+    Also populate lyrics and caption fields from the generated audio.
+    
+    Returns:
+        Tuple of (src_audio, generation_mode, lyrics, caption)
     """
     if audio_file is None:
-        return (gr.skip(),) * 2
+        return (gr.skip(),) * 4
+    
+    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    
     return (
         audio_file,                       # src_audio
         gr.update(value="Remix"),         # generation_mode -> Remix
+        lyrics,                           # lyrics
+        caption,                          # caption
     )
 
 
 def send_audio_to_repaint(audio_file, lm_metadata):
     """Send generated audio to src_audio and switch mode to Repaint.
+    Also populate lyrics field with lyrics from the generated audio.
     
     Returns:
-        Tuple of (src_audio, generation_mode)
+        Tuple of (src_audio, generation_mode, lyrics, caption)
     """
     if audio_file is None:
-        return (gr.skip(),) * 2
+        return (gr.skip(),) * 4
+    
+    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    
     return (
         audio_file,                       # src_audio
         gr.update(value="Repaint"),       # generation_mode -> Repaint
+        lyrics,                           # lyrics
+        caption,                          # caption
     )
 
 

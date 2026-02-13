@@ -2273,6 +2273,8 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                 logger.info("🔍 [DEBUG] DiT TEXT ENCODER INPUT (Inference)")
                 logger.info(f"{'='*70}")
                 logger.info(f"text_prompt:\n{text_prompt}")
+                logger.info(f"{'='*70}")
+                logger.info(f"lyrics_text:\n{self._format_lyrics(lyrics[i], actual_language)}")
                 logger.info(f"{'='*70}\n")
 
             # Tokenize text
