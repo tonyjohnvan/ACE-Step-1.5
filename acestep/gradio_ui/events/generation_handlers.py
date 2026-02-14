@@ -1197,19 +1197,35 @@ def compute_mode_ui_updates(mode: str, llm_handler=None):
         autogen_update = gr.update(visible=False, value=False, interactive=False)
         auto_lrc_update = gr.update(visible=False, value=False, interactive=False)
         analyze_btn_update = gr.update(visible=False)
-    else:
-        # Non-Extract: use gr.skip() to leave these unchanged
-        captions_update = gr.update(visible=True)
-        lyrics_update = gr.update(visible=True)
-        bpm_update = gr.update(interactive=True, visible=True)
-        key_scale_update = gr.update(interactive=True, visible=True)
-        time_signature_update = gr.update(interactive=True, visible=True)
-        vocal_language_update = gr.update(interactive=True, visible=True)
-        audio_duration_update = gr.update(interactive=True, visible=True)
+    elif not_simple:
+        # Non-Extract, non-Simple: restore visibility and interactivity for
+        # fields that Extract mode explicitly hid.  This ensures switching
+        # from Extract → Custom/Remix/etc. brings the fields back.
+        captions_update = gr.update(visible=True, interactive=True)
+        lyrics_update = gr.update(visible=True, interactive=True)
+        bpm_update = gr.update(visible=True, interactive=True)
+        key_scale_update = gr.update(visible=True, interactive=True)
+        time_signature_update = gr.update(visible=True, interactive=True)
+        vocal_language_update = gr.update(visible=True, interactive=True)
+        audio_duration_update = gr.update(visible=True, interactive=True)
         auto_score_update = gr.update(visible=True, interactive=True)
         autogen_update = gr.update(visible=True, interactive=True)
         auto_lrc_update = gr.update(visible=True, interactive=True)
         analyze_btn_update = gr.update(visible=True)
+    else:
+        # Simple mode: leave these fields unchanged (no-op).  Their visibility
+        # is controlled by parent containers (custom_mode_group, etc.).
+        captions_update = gr.update()
+        lyrics_update = gr.update()
+        bpm_update = gr.update()
+        key_scale_update = gr.update()
+        time_signature_update = gr.update()
+        vocal_language_update = gr.update()
+        audio_duration_update = gr.update()
+        auto_score_update = gr.update()
+        autogen_update = gr.update()
+        auto_lrc_update = gr.update()
+        analyze_btn_update = gr.update()
 
     return (
         gr.update(visible=show_simple),              # 0: simple_mode_group
