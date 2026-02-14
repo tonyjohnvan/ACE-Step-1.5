@@ -386,41 +386,41 @@ def load_training_checkpoint(
         logger.warning(f"Rejected unsafe checkpoint directory: {checkpoint_dir!r}")
         return result
 
-    # Find adapter path
-    adapter_path = _safe_checkpoint_dir(os.path.join(safe_dir, "adapter"))
-    if adapter_path is not None and os.path.isdir(adapter_path):
+    # Find adapter path (safe_dir is already validated)
+    adapter_path = os.path.join(safe_dir, "adapter")
+    if os.path.isdir(adapter_path):
         result["adapter_path"] = adapter_path
     elif os.path.isdir(safe_dir):
         result["adapter_path"] = safe_dir
 
     # Load training state (use safetensors; avoid unsafe pickle-based torch.load)
-    state_path_safe = _safe_checkpoint_dir(os.path.join(safe_dir, "training_state.safetensors"))
-    if state_path_safe is not None and os.path.isfile(state_path_safe):
+    # safe_dir is already validated, so we can join directly
+    state_path = os.path.join(safe_dir, "training_state.safetensors")
+    if os.path.isfile(state_path):
         # safetensors is a safe, non-executable tensor serialization format
         try:
-            device_str = None
-            if device is not None:
-                # load_file expects a device string like "cpu" or "cuda:0"
-                device_str = str(device)
-            training_state_tensors = load_file(state_path_safe, device=device_str)  # type: ignore[arg-type]
+            # Convert device to string format expected by load_file
+            # PyTorch device objects have proper __str__ that produces "cpu", "cuda:0", etc.
+            device_str = str(device) if device is not None else "cpu"
+            training_state_tensors = load_file(state_path, device=device_str)
 
             # Expect scalar tensors for epoch/global_step if present
             if "epoch" in training_state_tensors:
                 try:
                     result["epoch"] = int(training_state_tensors["epoch"].item())
-                except Exception:
-                    logger.warning("Failed to parse 'epoch' from training_state.safetensors, using default 0")
+                except (ValueError, TypeError, RuntimeError) as e:
+                    logger.warning(f"Failed to parse 'epoch' from training_state.safetensors: {e}, using default 0")
             if "global_step" in training_state_tensors:
                 try:
                     result["global_step"] = int(training_state_tensors["global_step"].item())
-                except Exception:
-                    logger.warning("Failed to parse 'global_step' from training_state.safetensors, using default 0")
+                except (ValueError, TypeError, RuntimeError) as e:
+                    logger.warning(f"Failed to parse 'global_step' from training_state.safetensors: {e}, using default 0")
 
             # For security, do not attempt to deserialize optimizer/scheduler state
             # from arbitrary objects. If tensor-only states are added in the future,
             # they can be wired here in a controlled way.
             logger.info(f"Loaded checkpoint metadata from epoch {result['epoch']}, step {result['global_step']}")
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"Failed to load training_state.safetensors: {e}")
     else:
         # Fallback: extract epoch from path
