@@ -56,6 +56,9 @@ _load_env_file() {
             LANGUAGE)
                 [[ -n "$value" ]] && LANGUAGE="$value"
                 ;;
+            ACESTEP_BATCH_SIZE)
+                [[ -n "$value" ]] && BATCH_SIZE="--batch_size $value"
+                ;;
         esac
     done < "$env_file"
     
@@ -78,6 +81,11 @@ SHARE="${SHARE:-}"
 
 # UI language: en, zh, he, ja
 : "${LANGUAGE:=en}"
+
+# Batch size: default batch size for generation (1 to GPU-dependent max)
+# When not specified, defaults to min(2, GPU_max)
+BATCH_SIZE="${BATCH_SIZE:-}"
+# BATCH_SIZE="--batch_size 4"
 
 # Model settings
 : "${CONFIG_PATH:=--config_path acestep-v15-turbo}"
@@ -296,6 +304,7 @@ CMD="uv run acestep --port $PORT --server-name $SERVER_NAME --language $LANGUAGE
 [[ -n "$INIT_LLM" ]] && CMD="$CMD $INIT_LLM"
 [[ -n "$DOWNLOAD_SOURCE" ]] && CMD="$CMD $DOWNLOAD_SOURCE"
 [[ -n "$INIT_SERVICE" ]] && CMD="$CMD $INIT_SERVICE"
+[[ -n "$BATCH_SIZE" ]] && CMD="$CMD $BATCH_SIZE"
 [[ -n "$ENABLE_API" ]] && CMD="$CMD $ENABLE_API"
 [[ -n "$API_KEY" ]] && CMD="$CMD $API_KEY"
 [[ -n "$AUTH_USERNAME" ]] && CMD="$CMD $AUTH_USERNAME"

@@ -7,6 +7,10 @@ from loguru import logger
 
 from acestep.constants import DEFAULT_DIT_INSTRUCTION
 
+# Maximum batch size supported per coding guidelines
+# (batch operations are supported up to 8 songs)
+MAX_BATCH_SIZE = 8
+
 
 class ServiceGenerateRequestMixin:
     """Prepare normalized service-generation inputs before diffusion execution."""
@@ -51,8 +55,25 @@ class ServiceGenerateRequestMixin:
             )
             infer_steps = 8
 
+        # Convert captions to list and determine batch size
         if isinstance(captions, str):
             captions = [captions]
+        
+        batch_size = len(captions)
+        
+        # Validate and clamp batch size to maximum supported
+        if batch_size > MAX_BATCH_SIZE:
+            logger.warning(
+                "[service_generate] Batch size {} exceeds maximum supported batch size ({}). "
+                "Clamping to {}.",
+                batch_size,
+                MAX_BATCH_SIZE,
+                MAX_BATCH_SIZE,
+            )
+            batch_size = MAX_BATCH_SIZE
+            captions = captions[:batch_size]
+        
+        # Now convert other inputs to lists, using the clamped batch_size
         if isinstance(lyrics, str):
             lyrics = [lyrics]
         if isinstance(keys, str):
@@ -65,8 +86,19 @@ class ServiceGenerateRequestMixin:
             repainting_start = [repainting_start]
         if isinstance(repainting_end, (int, float)):
             repainting_end = [repainting_end]
-
-        batch_size = len(captions)
+        
+        # Truncate list inputs that exceed clamped batch size
+        if keys is not None and len(keys) > batch_size:
+            keys = keys[:batch_size]
+        if metas is not None and len(metas) > batch_size:
+            metas = metas[:batch_size]
+        if vocal_languages is not None and len(vocal_languages) > batch_size:
+            vocal_languages = vocal_languages[:batch_size]
+        if repainting_start is not None and len(repainting_start) > batch_size:
+            repainting_start = repainting_start[:batch_size]
+        if repainting_end is not None and len(repainting_end) > batch_size:
+            repainting_end = repainting_end[:batch_size]
+        
         if len(lyrics) < batch_size:
             fill = lyrics[-1] if lyrics else ""
             lyrics = list(lyrics) + [fill] * (batch_size - len(lyrics))

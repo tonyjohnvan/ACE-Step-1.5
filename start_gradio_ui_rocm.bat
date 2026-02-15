@@ -41,6 +41,10 @@ REM set SHARE=--share
 REM UI language: en, zh, ja
 if not defined LANGUAGE set LANGUAGE=en
 
+REM Batch size: default batch size for generation (1 to GPU-dependent max)
+REM When not specified, defaults to min(2, GPU_max)
+REM set BATCH_SIZE=--batch_size 4
+
 REM ==================== Model Configuration ====================
 if not defined CONFIG_PATH set CONFIG_PATH=--config_path acestep-v15-turbo
 if not defined LM_MODEL_PATH set LM_MODEL_PATH=--lm_model_path acestep-5Hz-lm-4B
@@ -195,6 +199,7 @@ if not "%OFFLOAD_TO_CPU%"=="" set "CMD=!CMD! %OFFLOAD_TO_CPU%"
 if not "%INIT_LLM%"=="" set "CMD=!CMD! %INIT_LLM%"
 if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
 if not "%INIT_SERVICE%"=="" set "CMD=!CMD! %INIT_SERVICE%"
+if not "%BATCH_SIZE%"=="" set "CMD=!CMD! %BATCH_SIZE%"
 if not "%BACKEND%"=="" set "CMD=!CMD! %BACKEND%"
 if not "%ENABLE_API%"=="" set "CMD=!CMD! %ENABLE_API%"
 if not "%API_KEY%"=="" set "CMD=!CMD! %API_KEY%"
@@ -256,6 +261,9 @@ for /f "usebackq tokens=1,* delims==" %%a in ("%ENV_FILE%") do (
             )
             if /i "!key!"=="LANGUAGE" (
                 if not "!value!"=="" set "LANGUAGE=!value!"
+            )
+            if /i "!key!"=="ACESTEP_BATCH_SIZE" (
+                if not "!value!"=="" set "BATCH_SIZE=--batch_size !value!"
             )
         )
     )
