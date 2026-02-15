@@ -56,9 +56,6 @@ _load_env_file() {
             LANGUAGE)
                 [[ -n "$value" ]] && LANGUAGE="$value"
                 ;;
-            ACESTEP_CONDA_ENV)
-                [[ -n "$value" ]] && ACESTEP_CONDA_ENV="$value"
-                ;;
         esac
     done < "$env_file"
     
@@ -194,73 +191,10 @@ echo "Starting ACE-Step Gradio Web UI..."
 echo "Server will be available at: http://${SERVER_NAME}:${PORT}"
 echo
 
-# ==================== aarch64 / DGX Spark: conda shortcut ====================
-# On aarch64 Linux (e.g. NVIDIA DGX Spark), uv works natively with the cu130
-# PyTorch index. However, if the user already has an active conda env with CUDA
-# PyTorch (or sets ACESTEP_CONDA_ENV), honour that and skip uv entirely.
-_ARCH="$(uname -m)"
-if [[ "$_ARCH" == "aarch64" && "$(uname -s)" == "Linux" ]]; then
-    CONDA_ENV="${ACESTEP_CONDA_ENV:-${CONDA_DEFAULT_ENV:-}}"
-
-    if [[ -n "$CONDA_ENV" && "$CONDA_ENV" != "base" ]]; then
-        echo "[Platform] aarch64 Linux + conda env '$CONDA_ENV' detected"
-
-        # Verify PyTorch has CUDA support in the conda env
-        if [[ "$CONDA_DEFAULT_ENV" == "$CONDA_ENV" ]]; then
-            _PY=python
-        else
-            _PY="conda run --no-banner -n $CONDA_ENV python"
-        fi
-
-        if $_PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-            _cuda_ver=$($_PY -c "import torch; print(torch.version.cuda)" 2>/dev/null)
-            _gpu=$($_PY -c "import torch; print(torch.cuda.get_device_name(0))" 2>/dev/null)
-            echo "[Platform] Using conda (CUDA ${_cuda_ver} | ${_gpu})"
-            echo
-
-            # Install project if not already present
-            if ! $_PY -c "import acestep" 2>/dev/null; then
-                echo "[Setup] Installing ACE-Step into conda env '$CONDA_ENV'..."
-                $_PY -m pip install -e "$SCRIPT_DIR" --no-build-isolation --no-deps -q
-                $_PY -m pip install -e "$SCRIPT_DIR/acestep/third_parts/nano-vllm" --no-build-isolation --no-deps -q 2>/dev/null
-                echo "[Setup] Done."
-                echo
-            fi
-
-            echo "Starting ACE-Step Gradio UI (conda)..."
-            echo
-
-            if [[ "$CONDA_DEFAULT_ENV" == "$CONDA_ENV" ]]; then
-                CMD="acestep"
-            else
-                CMD="conda run --no-banner -n $CONDA_ENV acestep"
-            fi
-            CMD="$CMD --port $PORT --server-name $SERVER_NAME --language $LANGUAGE"
-            [[ -n "$SHARE" ]] && CMD="$CMD $SHARE"
-            [[ -n "$CONFIG_PATH" ]] && CMD="$CMD $CONFIG_PATH"
-            [[ -n "$LM_MODEL_PATH" ]] && CMD="$CMD $LM_MODEL_PATH"
-            [[ -n "$OFFLOAD_TO_CPU" ]] && CMD="$CMD $OFFLOAD_TO_CPU"
-            [[ -n "$INIT_LLM" ]] && CMD="$CMD $INIT_LLM"
-            [[ -n "$DOWNLOAD_SOURCE" ]] && CMD="$CMD $DOWNLOAD_SOURCE"
-            [[ -n "$INIT_SERVICE" ]] && CMD="$CMD $INIT_SERVICE"
-            [[ -n "$ENABLE_API" ]] && CMD="$CMD $ENABLE_API"
-            [[ -n "$API_KEY" ]] && CMD="$CMD $API_KEY"
-            [[ -n "$AUTH_USERNAME" ]] && CMD="$CMD $AUTH_USERNAME"
-            [[ -n "$AUTH_PASSWORD" ]] && CMD="$CMD $AUTH_PASSWORD"
-
-            cd "$SCRIPT_DIR" && $CMD
-            exit $?
-        else
-            echo "[Platform] Conda env '$CONDA_ENV' has no CUDA torch, falling through to uv"
-            echo
-        fi
-    fi
-    # No active conda env (or no CUDA torch) -- fall through to standard uv workflow.
-    # uv will install torch==2.10.0+cu130 from the cu130 index automatically.
-fi
-
 # ==================== Standard uv Workflow ====================
-# (x86_64 Linux, Windows/WSL, macOS -- CUDA/MPS pip wheels available)
+# Works on all platforms: x86_64 Linux (cu128), aarch64 Linux/DGX Spark (cu130),
+# macOS (MPS), Windows (cu128). uv resolves the correct PyTorch wheels via
+# platform-specific index mappings in pyproject.toml.
 
 # Check if uv is installed
 if ! command -v uv &>/dev/null; then
