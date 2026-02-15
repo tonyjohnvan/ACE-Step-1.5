@@ -655,6 +655,11 @@ def generate_music(
             if lm_generated_audio_codes_list and idx < len(lm_generated_audio_codes_list):
                 audio_params["audio_codes"] = lm_generated_audio_codes_list[idx]
 
+            # Add LoRA state to params for UUID generation (ensures different UUIDs when only LoRA state changes)
+            audio_params["lora_loaded"] = dit_handler.lora_loaded
+            audio_params["use_lora"] = dit_handler.use_lora
+            audio_params["lora_scale"] = dit_handler.lora_scale
+
             # Get audio tensor and metadata
             audio_tensor = dit_audio.get("tensor")
             sample_rate = dit_audio.get("sample_rate", 48000)

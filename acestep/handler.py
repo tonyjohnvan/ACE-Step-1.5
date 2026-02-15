@@ -50,6 +50,8 @@ from acestep.core.generation.handler import (
     DiffusionMixin,
     InitServiceMixin,
     IoAudioMixin,
+    LyricScoreMixin,
+    LyricTimestampMixin,
     LoraManagerMixin,
     MemoryUtilsMixin,
     MetadataMixin,
@@ -57,8 +59,10 @@ from acestep.core.generation.handler import (
     ProgressMixin,
     PromptMixin,
     TaskUtilsMixin,
+    ServiceGenerateRequestMixin,
+    ServiceGenerateExecuteMixin,
+    ServiceGenerateOutputsMixin,
 )
-from acestep.dit_alignment_score import MusicStampsAligner, MusicLyricScorer
 from acestep.gpu_config import get_gpu_memory_gb, get_global_gpu_config, get_effective_free_vram_gb
 
 
@@ -76,6 +80,8 @@ class AceStepHandler(
     ConditioningTextMixin,
     IoAudioMixin,
     InitServiceMixin,
+    LyricScoreMixin,
+    LyricTimestampMixin,
     LoraManagerMixin,
     MemoryUtilsMixin,
     MetadataMixin,
@@ -83,10 +89,14 @@ class AceStepHandler(
     ProgressMixin,
     PromptMixin,
     TaskUtilsMixin,
+    ServiceGenerateRequestMixin,
+    ServiceGenerateExecuteMixin,
+    ServiceGenerateOutputsMixin,
 ):
     """ACE-Step Business Logic Handler"""
     
     def __init__(self):
+        """Initialize runtime model handles, feature flags, and generation state."""
         self.model = None
         self.config = None
         self.device = "cpu"
@@ -237,6 +247,7 @@ class AceStepHandler(
             if use_fp16:
                 try:
                     def _to_fp16(x):
+                        """Cast floating MLX arrays to float16 and keep other values unchanged."""
                         if isinstance(x, mx.array) and mx.issubdtype(x.dtype, mx.floating):
                             return x.astype(mx.float16)
                         return x
@@ -770,6 +781,7 @@ class AceStepHandler(
                         # don't fully support .to(device) on AffineQuantizedTensor, and these
                         # layers are too small to benefit from quantization anyway.
                         def _dit_filter_fn(module, fqn):
+                            """Keep only DiT linear layers and exclude tokenizer/detokenizer paths."""
                             if not _is_linear(module, fqn):
                                 return False
                             # Exclude tokenizer/detokenizer (including via _orig_mod prefix from torch.compile)
@@ -956,279 +968,101 @@ class AceStepHandler(
         infer_method: str = "ode",
         timesteps: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
+        """Generate music latents from text/audio conditioning inputs.
 
-        """
-        Generate music from text inputs.
-        
         Args:
-            captions: Text caption(s) describing the music (optional, can be empty strings)
-            lyrics: Lyric text(s) (optional, can be empty strings)
-            keys: Unique identifier(s) (optional)
-            target_wavs: Target audio tensor(s) for conditioning (optional)
-            refer_audios: Reference audio tensor(s) for style transfer (optional)
-            metas: Metadata dict(s) or string(s) (optional)
-            vocal_languages: Language code(s) for lyrics (optional, defaults to 'en')
-            infer_steps: Number of inference steps (default: 60)
-            guidance_scale: Guidance scale for generation (default: 7.0)
-            seed: Random seed (optional)
-            return_intermediate: Whether to return intermediate results (default: False)
-            repainting_start: Start time(s) for repainting region in seconds (optional)
-            repainting_end: End time(s) for repainting region in seconds (optional)
-            instructions: Instruction text(s) for generation (optional)
-            audio_cover_strength: Strength of audio cover mode (default: 1.0)
-            cover_noise_strength: Strength of cover noise init (0=pure noise, 1=closest to src audio) (default: 0.0)
-            use_adg: Whether to use ADG (Adaptive Diffusion Guidance) (default: False)
-            cfg_interval_start: Start of CFG interval (0.0-1.0, default: 0.0)
-            cfg_interval_end: End of CFG interval (0.0-1.0, default: 1.0)
-            
+            captions: Caption text(s) describing target music.
+            lyrics: Lyric text(s) used for lyric conditioning.
+            keys: Optional sample identifiers.
+            target_wavs: Optional target audio tensor for repaint/cover.
+            refer_audios: Optional reference audio tensors for style conditioning.
+            metas: Optional metadata strings/dicts per sample.
+            vocal_languages: Optional lyric language code(s).
+            infer_steps: Diffusion inference steps.
+            guidance_scale: Classifier-free guidance scale.
+            seed: Optional single seed or per-sample seed list.
+            return_intermediate: Reserved compatibility flag (handled by caller flow).
+            repainting_start: Optional repaint start time(s) in seconds.
+            repainting_end: Optional repaint end time(s) in seconds.
+            instructions: Optional instruction text(s) per sample.
+            audio_cover_strength: Blend strength for cover mode.
+            cover_noise_strength: Initial-noise blend strength for cover mode.
+            use_adg: Whether to enable adaptive diffusion guidance.
+            cfg_interval_start: CFG schedule start ratio.
+            cfg_interval_end: CFG schedule end ratio.
+            shift: Diffusion time-shift parameter.
+            audio_code_hints: Optional serialized audio-code hints.
+            infer_method: Diffusion method selector.
+            timesteps: Optional custom timestep schedule.
+
         Returns:
-            Dictionary containing:
-            - pred_wavs: Generated audio tensors
-            - target_wavs: Input target audio (if provided)
-            - vqvae_recon_wavs: VAE reconstruction of target
-            - keys: Identifiers used
-            - text_inputs: Formatted text inputs
-            - sr: Sample rate
-            - spans: Generation spans
-            - time_costs: Timing information
-            - seed_num: Seed used
+            Dict[str, Any]: Model output payload with latents, masks, spans, timing, and cached
+            condition tensors required by downstream result handlers.
         """
-        if self.config.is_turbo:
-            # Limit inference steps to maximum 8
-            if infer_steps > 8:
-                logger.warning(f"[service_generate] dmd_gan version: infer_steps {infer_steps} exceeds maximum 8, clamping to 8")
-                infer_steps = 8
-            # CFG parameters are not adjustable for dmd_gan (they will be ignored)
-            # Note: guidance_scale, cfg_interval_start, cfg_interval_end are still passed but may be ignored by the model
-        
-        # Convert single inputs to lists
-        if isinstance(captions, str):
-            captions = [captions]
-        if isinstance(lyrics, str):
-            lyrics = [lyrics]
-        if isinstance(keys, str):
-            keys = [keys]
-        if isinstance(vocal_languages, str):
-            vocal_languages = [vocal_languages]
-        if isinstance(metas, (str, dict)):
-            metas = [metas]
-            
-        # Convert repainting parameters to lists
-        if isinstance(repainting_start, (int, float)):
-            repainting_start = [repainting_start]
-        if isinstance(repainting_end, (int, float)):
-            repainting_end = [repainting_end]
-        
-        # Get batch size from captions
-        batch_size = len(captions)
-
-        # Normalize lyrics to match batch size (so conditioning always has caption + lyric per item, including repaint)
-        if len(lyrics) < batch_size:
-            fill = lyrics[-1] if lyrics else ""
-            lyrics = list(lyrics) + [fill] * (batch_size - len(lyrics))
-        elif len(lyrics) > batch_size:
-            lyrics = lyrics[:batch_size]
-
-        # Normalize instructions and audio_code_hints to match batch size
-        instructions = self._normalize_instructions(instructions, batch_size, DEFAULT_DIT_INSTRUCTION) if instructions is not None else None
-        audio_code_hints = self._normalize_audio_code_hints(audio_code_hints, batch_size) if audio_code_hints is not None else None
-        
-        # Convert seed to list format
-        if seed is None:
-            seed_list = None
-        elif isinstance(seed, list):
-            seed_list = seed
-            # Ensure we have enough seeds for batch size
-            if len(seed_list) < batch_size:
-                # Pad with last seed or random seeds
-                import random
-                while len(seed_list) < batch_size:
-                    seed_list.append(random.randint(0, 2**32 - 1))
-            elif len(seed_list) > batch_size:
-                # Truncate to batch size
-                seed_list = seed_list[:batch_size]
-        else:
-            # Single seed value - use for all batch items
-            seed_list = [int(seed)] * batch_size
-
-        # Don't set global random seed here - each item will use its own seed
-        
-        # Prepare batch
-        batch = self._prepare_batch(
+        _ = return_intermediate
+        normalized = self._normalize_service_generate_inputs(
             captions=captions,
             lyrics=lyrics,
             keys=keys,
-            target_wavs=target_wavs,
-            refer_audios=refer_audios,
             metas=metas,
             vocal_languages=vocal_languages,
             repainting_start=repainting_start,
             repainting_end=repainting_end,
             instructions=instructions,
             audio_code_hints=audio_code_hints,
+            infer_steps=infer_steps,
+            seed=seed,
+        )
+        batch = self._prepare_batch(
+            captions=normalized["captions"],
+            lyrics=normalized["lyrics"],
+            keys=normalized["keys"],
+            target_wavs=target_wavs,
+            refer_audios=refer_audios,
+            metas=normalized["metas"],
+            vocal_languages=normalized["vocal_languages"],
+            repainting_start=normalized["repainting_start"],
+            repainting_end=normalized["repainting_end"],
+            instructions=normalized["instructions"],
+            audio_code_hints=normalized["audio_code_hints"],
             audio_cover_strength=audio_cover_strength,
             cover_noise_strength=cover_noise_strength,
         )
-        
-        processed_data = self.preprocess_batch(batch)
-        
-        (
-            keys,
-            text_inputs,
-            src_latents,
-            target_latents,
-            # model inputs
-            text_hidden_states,
-            text_attention_mask,
-            lyric_hidden_states,
-            lyric_attention_mask,
-            audio_attention_mask,
-            refer_audio_acoustic_hidden_states_packed,
-            refer_audio_order_mask,
-            chunk_mask,
-            spans,
-            is_covers,
-            audio_codes,
-            lyric_token_idss,
-            precomputed_lm_hints_25Hz,
-            non_cover_text_hidden_states,
-            non_cover_text_attention_masks,
-        ) = processed_data
-
-        # Set generation parameters
-        # Use seed_list if available, otherwise generate a single seed
-        if seed_list is not None:
-            # Pass seed list to model (will be handled there)
-            seed_param = seed_list
-        else:
-            seed_param = random.randint(0, 2**32 - 1)
-        
-        # Ensure silence_latent is on the correct device before creating generate_kwargs
+        payload = self._unpack_service_processed_data(self.preprocess_batch(batch))
+        seed_param = self._resolve_service_seed_param(normalized["seed_list"])
         self._ensure_silence_latent_on_device()
-        
-        generate_kwargs = {
-            "text_hidden_states": text_hidden_states,
-            "text_attention_mask": text_attention_mask,
-            "lyric_hidden_states": lyric_hidden_states,
-            "lyric_attention_mask": lyric_attention_mask,
-            "refer_audio_acoustic_hidden_states_packed": refer_audio_acoustic_hidden_states_packed,
-            "refer_audio_order_mask": refer_audio_order_mask,
-            "src_latents": src_latents,
-            "chunk_masks": chunk_mask,
-            "is_covers": is_covers,
-            "silence_latent": self.silence_latent,
-            "seed": seed_param,
-            "non_cover_text_hidden_states": non_cover_text_hidden_states,
-            "non_cover_text_attention_mask": non_cover_text_attention_masks,
-            "precomputed_lm_hints_25Hz": precomputed_lm_hints_25Hz,
-            "audio_cover_strength": audio_cover_strength,
-            "cover_noise_strength": cover_noise_strength,
-            "infer_method": infer_method,
-            "infer_steps": infer_steps,
-            "diffusion_guidance_sale": guidance_scale,
-            "use_adg": use_adg,
-            "cfg_interval_start": cfg_interval_start,
-            "cfg_interval_end": cfg_interval_end,
-            "shift": shift,
-        }
-        # Add custom timesteps if provided (convert to tensor)
-        if timesteps is not None:
-            generate_kwargs["timesteps"] = torch.tensor(timesteps, dtype=torch.float32, device=self.device)
-        dit_backend = "MLX (native)" if (self.use_mlx_dit and self.mlx_decoder is not None) else f"PyTorch ({self.device})"
-        logger.info(f"[service_generate] Generating audio... (DiT backend: {dit_backend})")
-        with torch.inference_mode():
-            with self._load_model_context("model"):
-                # Prepare condition tensors first (for LRC timestamp generation)
-                encoder_hidden_states, encoder_attention_mask, context_latents = self.model.prepare_condition(
-                    text_hidden_states=text_hidden_states,
-                    text_attention_mask=text_attention_mask,
-                    lyric_hidden_states=lyric_hidden_states,
-                    lyric_attention_mask=lyric_attention_mask,
-                    refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
-                    refer_audio_order_mask=refer_audio_order_mask,
-                    hidden_states=src_latents,
-                    attention_mask=torch.ones(src_latents.shape[0], src_latents.shape[1], device=src_latents.device, dtype=src_latents.dtype),
-                    silence_latent=self.silence_latent,
-                    src_latents=src_latents,
-                    chunk_masks=chunk_mask,
-                    is_covers=is_covers,
-                    precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
-                )
-
-                # ---- MLX fast-path for the diffusion loop ----
-                if self.use_mlx_dit and self.mlx_decoder is not None:
-                    try:
-                        # For non-cover blend, prepare the non-cover conditions via PyTorch
-                        enc_hs_nc, enc_am_nc, ctx_nc = None, None, None
-                        if audio_cover_strength < 1.0 and non_cover_text_hidden_states is not None:
-                            non_is_covers = torch.zeros_like(is_covers)
-                            sil_exp = self.silence_latent[:, :src_latents.shape[1], :].expand(
-                                src_latents.shape[0], -1, -1
-                            )
-                            enc_hs_nc, enc_am_nc, ctx_nc = self.model.prepare_condition(
-                                text_hidden_states=non_cover_text_hidden_states,
-                                text_attention_mask=non_cover_text_attention_masks,
-                                lyric_hidden_states=lyric_hidden_states,
-                                lyric_attention_mask=lyric_attention_mask,
-                                refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
-                                refer_audio_order_mask=refer_audio_order_mask,
-                                hidden_states=sil_exp,
-                                attention_mask=torch.ones(
-                                    sil_exp.shape[0], sil_exp.shape[1],
-                                    device=sil_exp.device, dtype=sil_exp.dtype,
-                                ),
-                                silence_latent=self.silence_latent,
-                                src_latents=sil_exp,
-                                chunk_masks=chunk_mask,
-                                is_covers=non_is_covers,
-                            )
-
-                        ts_arg = generate_kwargs.get("timesteps")
-                        outputs = self._mlx_run_diffusion(
-                            encoder_hidden_states=encoder_hidden_states,
-                            encoder_attention_mask=encoder_attention_mask,
-                            context_latents=context_latents,
-                            src_latents=src_latents,
-                            seed=seed_param,
-                            infer_method=infer_method,
-                            shift=shift,
-                            timesteps=ts_arg,
-                            audio_cover_strength=audio_cover_strength,
-                            encoder_hidden_states_non_cover=enc_hs_nc,
-                            encoder_attention_mask_non_cover=enc_am_nc,
-                            context_latents_non_cover=ctx_nc,
-                            disable_tqdm=self.disable_tqdm,
-                        )
-                        _tc = outputs.get("time_costs", {})
-                        _dt = _tc.get("diffusion_time_cost", 0)
-                        _ps = _tc.get("diffusion_per_step_time_cost", 0)
-                        logger.info(
-                            f"[service_generate] DiT diffusion complete via MLX ({_dt:.2f}s total, {_ps:.3f}s/step)."
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[service_generate] MLX diffusion failed (%s); falling back to PyTorch.",
-                            exc,
-                        )
-                        outputs = self.model.generate_audio(**generate_kwargs)
-                else:
-                    logger.info("[service_generate] DiT diffusion via PyTorch (%s)...", self.device)
-                    outputs = self.model.generate_audio(**generate_kwargs)
-        
-        # Add intermediate information to outputs for extra_outputs
-        outputs["src_latents"] = src_latents
-        outputs["target_latents_input"] = target_latents  # Input target latents (before generation)
-        outputs["chunk_masks"] = chunk_mask
-        outputs["spans"] = spans
-        outputs["latent_masks"] = batch.get("latent_masks")  # Latent masks for valid length
-        
-        # Add condition tensors for LRC timestamp generation
-        outputs["encoder_hidden_states"] = encoder_hidden_states
-        outputs["encoder_attention_mask"] = encoder_attention_mask
-        outputs["context_latents"] = context_latents
-        outputs["lyric_token_idss"] = lyric_token_idss
-        
-        return outputs
+        generate_kwargs = self._build_service_generate_kwargs(
+            payload=payload,
+            seed_param=seed_param,
+            infer_steps=normalized["infer_steps"],
+            guidance_scale=guidance_scale,
+            audio_cover_strength=audio_cover_strength,
+            cover_noise_strength=cover_noise_strength,
+            infer_method=infer_method,
+            use_adg=use_adg,
+            cfg_interval_start=cfg_interval_start,
+            cfg_interval_end=cfg_interval_end,
+            shift=shift,
+            timesteps=timesteps,
+        )
+        outputs, encoder_hidden_states, encoder_attention_mask, context_latents = (
+            self._execute_service_generate_diffusion(
+                payload=payload,
+                generate_kwargs=generate_kwargs,
+                seed_param=seed_param,
+                infer_method=infer_method,
+                shift=shift,
+                audio_cover_strength=audio_cover_strength,
+            )
+        )
+        return self._attach_service_generate_outputs(
+            outputs=outputs,
+            payload=payload,
+            batch=batch,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            context_latents=context_latents,
+        )
 
     # MPS-safe chunk parameters (class-level for testability)
     _MPS_DECODE_CHUNK_SIZE = 32
@@ -1799,6 +1633,7 @@ class AceStepHandler(
         """
         if progress is None:
             def progress(*args, **kwargs):
+                """No-op progress callback when no UI progress handler is provided."""
                 pass
 
         if self.model is None or self.vae is None or self.text_tokenizer is None or self.text_encoder is None:
@@ -1811,6 +1646,7 @@ class AceStepHandler(
             }
 
         def _has_audio_codes(v: Union[str, List[str]]) -> bool:
+            """Return True when at least one non-empty audio-code string is present."""
             if isinstance(v, list):
                 return any((x or "").strip() for x in v)
             return bool(v and str(v).strip())
@@ -2188,451 +2024,4 @@ class AceStepHandler(
                 "extra_outputs": {},
                 "success": False,
                 "error": str(e),
-            }
-
-    @torch.inference_mode()
-    def get_lyric_timestamp(
-        self,
-        pred_latent: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor,
-        context_latents: torch.Tensor,
-        lyric_token_ids: torch.Tensor,
-        total_duration_seconds: float,
-        vocal_language: str = "en",
-        inference_steps: int = 8,
-        seed: int = 42,
-        custom_layers_config: Optional[Dict] = None,
-    ) -> Dict[str, Any]:
-        """
-        Generate lyrics timestamps from generated audio latents using cross-attention alignment.
-        
-        This method adds noise to the final pred_latent and re-infers one step to get
-        cross-attention matrices, then uses DTW to align lyrics tokens with audio frames.
-        
-        Args:
-            pred_latent: Generated latent tensor [batch, T, D]
-            encoder_hidden_states: Cached encoder hidden states
-            encoder_attention_mask: Cached encoder attention mask
-            context_latents: Cached context latents
-            lyric_token_ids: Tokenized lyrics tensor [batch, seq_len]
-            total_duration_seconds: Total audio duration in seconds
-            vocal_language: Language code for lyrics header parsing
-            inference_steps: Number of inference steps (for noise level calculation)
-            seed: Random seed for noise generation
-            custom_layers_config: Dict mapping layer indices to head indices
-            
-        Returns:
-            Dict containing:
-            - lrc_text: LRC formatted lyrics with timestamps
-            - sentence_timestamps: List of SentenceTimestamp objects
-            - token_timestamps: List of TokenTimestamp objects
-            - success: Whether generation succeeded
-            - error: Error message if failed
-        """
-        from transformers.cache_utils import EncoderDecoderCache, DynamicCache
-        
-        if self.model is None:
-            return {
-                "lrc_text": "",
-                "sentence_timestamps": [],
-                "token_timestamps": [],
-                "success": False,
-                "error": "Model not initialized"
-            }
-        
-        if custom_layers_config is None:
-            custom_layers_config = self.custom_layers_config
-        
-        try:
-            # Move tensors to device
-            device = self.device
-            dtype = self.dtype
-            
-            pred_latent = pred_latent.to(device=device, dtype=dtype)
-            encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=dtype)
-            encoder_attention_mask = encoder_attention_mask.to(device=device, dtype=dtype)
-            context_latents = context_latents.to(device=device, dtype=dtype)
-            
-            bsz = pred_latent.shape[0]
-            
-            # Calculate noise level: t_last = 1.0 / inference_steps
-            t_last_val = 1.0 / inference_steps
-            t_curr_tensor = torch.tensor([t_last_val] * bsz, device=device, dtype=dtype)
-            
-            x1 = pred_latent
-            
-            # Generate noise
-            if seed is None:
-                x0 = torch.randn_like(x1)
-            else:
-                # MPS doesn't support torch.Generator(device="mps"); use CPU generator and move result
-                gen_device = "cpu" if (isinstance(device, str) and device == "mps") or (hasattr(device, 'type') and device.type == "mps") else device
-                generator = torch.Generator(device=gen_device).manual_seed(int(seed))
-                x0 = torch.randn(x1.shape, generator=generator, device=gen_device, dtype=dtype).to(device)
-            
-            # Add noise to pred_latent: xt = t * noise + (1 - t) * x1
-            xt = t_last_val * x0 + (1.0 - t_last_val) * x1
-
-            xt_in = xt
-            t_in = t_curr_tensor
-            
-            # Get null condition embedding
-            encoder_hidden_states_in = encoder_hidden_states
-            encoder_attention_mask_in = encoder_attention_mask
-            context_latents_in = context_latents
-            latent_length = x1.shape[1]
-            attention_mask = torch.ones(bsz, latent_length, device=device, dtype=dtype)
-            attention_mask_in = attention_mask
-            past_key_values = None
-            
-            # Run decoder with output_attentions=True
-            with self._load_model_context("model"):
-                decoder = self.model.decoder
-                decoder_outputs = decoder(
-                    hidden_states=xt_in,
-                    timestep=t_in,
-                    timestep_r=t_in,
-                    attention_mask=attention_mask_in,
-                    encoder_hidden_states=encoder_hidden_states_in,
-                    use_cache=False,
-                    past_key_values=past_key_values,
-                    encoder_attention_mask=encoder_attention_mask_in,
-                    context_latents=context_latents_in,
-                    output_attentions=True,
-                    custom_layers_config=custom_layers_config,
-                    enable_early_exit=True
-                )
-                
-                # Extract cross-attention matrices
-                if decoder_outputs[2] is None:
-                    return {
-                        "lrc_text": "",
-                        "sentence_timestamps": [],
-                        "token_timestamps": [],
-                        "success": False,
-                        "error": "Model did not return attentions"
-                    }
-                
-                cross_attns = decoder_outputs[2]  # Tuple of tensors (some may be None)
-                
-                captured_layers_list = []
-                for layer_attn in cross_attns:
-                    # Skip None values (layers that didn't return attention)
-                    if layer_attn is None:
-                        continue
-                    # Only take conditional part (first half of batch)
-                    cond_attn = layer_attn[:bsz]
-                    layer_matrix = cond_attn.transpose(-1, -2)
-                    captured_layers_list.append(layer_matrix)
-                
-                if not captured_layers_list:
-                    return {
-                        "lrc_text": "",
-                        "sentence_timestamps": [],
-                        "token_timestamps": [],
-                        "success": False,
-                        "error": "No valid attention layers returned"
-                    }
-                
-                stacked = torch.stack(captured_layers_list)
-                if bsz == 1:
-                    all_layers_matrix = stacked.squeeze(1)
-                else:
-                    all_layers_matrix = stacked
-            
-            # Process lyric token IDs to extract pure lyrics
-            if isinstance(lyric_token_ids, torch.Tensor):
-                raw_lyric_ids = lyric_token_ids[0].tolist()
-            else:
-                raw_lyric_ids = lyric_token_ids
-            
-            # Parse header to find lyrics start position
-            header_str = f"# Languages\n{vocal_language}\n\n# Lyric\n"
-            header_ids = self.text_tokenizer.encode(header_str, add_special_tokens=False)
-            start_idx = len(header_ids)
-            
-            # Find end of lyrics (before endoftext token)
-            try:
-                end_idx = raw_lyric_ids.index(151643)  # <|endoftext|> token
-            except ValueError:
-                end_idx = len(raw_lyric_ids)
-            
-            pure_lyric_ids = raw_lyric_ids[start_idx:end_idx]
-            pure_lyric_matrix = all_layers_matrix[:, :, start_idx:end_idx, :]
-            
-            # Create aligner and generate timestamps
-            aligner = MusicStampsAligner(self.text_tokenizer)
-            
-            align_info = aligner.stamps_align_info(
-                attention_matrix=pure_lyric_matrix,
-                lyrics_tokens=pure_lyric_ids,
-                total_duration_seconds=total_duration_seconds,
-                custom_config=custom_layers_config,
-                return_matrices=False,
-                violence_level=2.0,
-                medfilt_width=1,
-            )
-            
-            if align_info.get("calc_matrix") is None:
-                return {
-                    "lrc_text": "",
-                    "sentence_timestamps": [],
-                    "token_timestamps": [],
-                    "success": False,
-                    "error": align_info.get("error", "Failed to process attention matrix")
-                }
-            
-            # Generate timestamps
-            result = aligner.get_timestamps_and_lrc(
-                calc_matrix=align_info["calc_matrix"],
-                lyrics_tokens=pure_lyric_ids,
-                total_duration_seconds=total_duration_seconds
-            )
-            
-            return {
-                "lrc_text": result["lrc_text"],
-                "sentence_timestamps": result["sentence_timestamps"],
-                "token_timestamps": result["token_timestamps"],
-                "success": True,
-                "error": None
-            }
-            
-        except Exception as e:
-            error_msg = f"Error generating timestamps: {str(e)}"
-            logger.exception("[get_lyric_timestamp] Failed")
-            return {
-                "lrc_text": "",
-                "sentence_timestamps": [],
-                "token_timestamps": [],
-                "success": False,
-                "error": error_msg
-            }
-
-    @torch.inference_mode()
-    def get_lyric_score(
-            self,
-            pred_latent: torch.Tensor,
-            encoder_hidden_states: torch.Tensor,
-            encoder_attention_mask: torch.Tensor,
-            context_latents: torch.Tensor,
-            lyric_token_ids: torch.Tensor,
-            vocal_language: str = "en",
-            inference_steps: int = 8,
-            seed: int = 42,
-            custom_layers_config: Optional[Dict] = None,
-    ) -> Dict[str, Any]:
-        """
-        Calculate both LM and DiT alignment scores in one pass.
-
-        - lm_score: Checks structural alignment using pure noise at t=1.0.
-        - dit_score: Checks denoising alignment using regressed latents at t=1/steps.
-
-        Args:
-            pred_latent: Generated latent tensor [batch, T, D]
-            encoder_hidden_states: Cached encoder hidden states
-            encoder_attention_mask: Cached encoder attention mask
-            context_latents: Cached context latents
-            lyric_token_ids: Tokenized lyrics tensor [batch, seq_len]
-            vocal_language: Language code for lyrics header parsing
-            inference_steps: Number of inference steps (for noise level calculation)
-            seed: Random seed for noise generation
-            custom_layers_config: Dict mapping layer indices to head indices
-
-        Returns:
-            Dict containing:
-            - lm_score: float
-            - dit_score: float
-            - success: Whether generation succeeded
-            - error: Error message if failed
-        """
-        from transformers.cache_utils import EncoderDecoderCache, DynamicCache
-
-        if self.model is None:
-            return {
-                "lm_score": 0.0,
-                "dit_score": 0.0,
-                "success": False,
-                "error": "Model not initialized"
-            }
-
-        if custom_layers_config is None:
-            custom_layers_config = self.custom_layers_config
-
-        try:
-            # Move tensors to device
-            device = self.device
-            dtype = self.dtype
-
-            pred_latent = pred_latent.to(device=device, dtype=dtype)
-            encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=dtype)
-            encoder_attention_mask = encoder_attention_mask.to(device=device, dtype=dtype)
-            context_latents = context_latents.to(device=device, dtype=dtype)
-
-            bsz = pred_latent.shape[0]
-
-            if seed is None:
-                x0 = torch.randn_like(pred_latent)
-            else:
-                # MPS doesn't support torch.Generator(device="mps"); use CPU generator and move result
-                gen_device = "cpu" if (isinstance(device, str) and device == "mps") or (hasattr(device, 'type') and device.type == "mps") else device
-                generator = torch.Generator(device=gen_device).manual_seed(int(seed))
-                x0 = torch.randn(pred_latent.shape, generator=generator, device=gen_device, dtype=dtype).to(device)
-
-            # --- Input A: LM Score ---
-            # t = 1.0, xt = Pure Noise
-            t_lm = torch.tensor([1.0] * bsz, device=device, dtype=dtype)
-            xt_lm = x0
-
-            # --- Input B: DiT Score ---
-            # t = 1.0/steps, xt = Regressed Latent
-            t_last_val = 1.0 / inference_steps
-            t_dit = torch.tensor([t_last_val] * bsz, device=device, dtype=dtype)
-            # Flow Matching Regression: xt = t*x0 + (1-t)*x1
-            xt_dit = t_last_val * x0 + (1.0 - t_last_val) * pred_latent
-
-            # Order: [Think_Batch, DiT_Batch]
-            xt_in = torch.cat([xt_lm, xt_dit], dim=0)
-            t_in = torch.cat([t_lm, t_dit], dim=0)
-
-            # Duplicate conditions
-            encoder_hidden_states_in = torch.cat([encoder_hidden_states, encoder_hidden_states], dim=0)
-            encoder_attention_mask_in = torch.cat([encoder_attention_mask, encoder_attention_mask], dim=0)
-            context_latents_in = torch.cat([context_latents, context_latents], dim=0)
-
-            # Prepare Attention Mask
-            latent_length = xt_in.shape[1]
-            attention_mask_in = torch.ones(2 * bsz, latent_length, device=device, dtype=dtype)
-            past_key_values = None
-
-            # Run decoder with output_attentions=True
-            with self._load_model_context("model"):
-                decoder = self.model.decoder
-                if hasattr(decoder, 'eval'):
-                    decoder.eval()
-
-                decoder_outputs = decoder(
-                    hidden_states=xt_in,
-                    timestep=t_in,
-                    timestep_r=t_in,
-                    attention_mask=attention_mask_in,
-                    encoder_hidden_states=encoder_hidden_states_in,
-                    use_cache=False,
-                    past_key_values=past_key_values,
-                    encoder_attention_mask=encoder_attention_mask_in,
-                    context_latents=context_latents_in,
-                    output_attentions=True,
-                    custom_layers_config=custom_layers_config,
-                    enable_early_exit=True
-                )
-
-                # Extract cross-attention matrices
-                if decoder_outputs[2] is None:
-                    return {
-                        "lm_score": 0.0,
-                        "dit_score": 0.0,
-                        "success": False,
-                        "error": "Model did not return attentions"
-                    }
-
-                cross_attns = decoder_outputs[2]  # Tuple of tensors (some may be None)
-
-                captured_layers_list = []
-                for layer_attn in cross_attns:
-                    if layer_attn is None:
-                        continue
-
-                    # Only take conditional part (first half of batch)
-                    layer_matrix = layer_attn.transpose(-1, -2)
-                    captured_layers_list.append(layer_matrix)
-
-                if not captured_layers_list:
-                    return {
-                        "lm_score": 0.0,
-                        "dit_score": 0.0,
-                        "success": False,
-                        "error": "No valid attention layers returned"
-                    }
-
-                stacked = torch.stack(captured_layers_list)
-
-                all_layers_matrix_lm = stacked[:, :bsz, ...]
-                all_layers_matrix_dit = stacked[:, bsz:, ...]
-
-                if bsz == 1:
-                    all_layers_matrix_lm = all_layers_matrix_lm.squeeze(1)
-                    all_layers_matrix_dit = all_layers_matrix_dit.squeeze(1)
-                else:
-                    pass
-
-            # Process lyric token IDs to extract pure lyrics
-            if isinstance(lyric_token_ids, torch.Tensor):
-                raw_lyric_ids = lyric_token_ids[0].tolist()
-            else:
-                raw_lyric_ids = lyric_token_ids
-
-            # Parse header to find lyrics start position
-            header_str = f"# Languages\n{vocal_language}\n\n# Lyric\n"
-            header_ids = self.text_tokenizer.encode(header_str, add_special_tokens=False)
-            start_idx = len(header_ids)
-
-            # Find end of lyrics (before endoftext token)
-            try:
-                end_idx = raw_lyric_ids.index(151643)  # <|endoftext|> token
-            except ValueError:
-                end_idx = len(raw_lyric_ids)
-
-            pure_lyric_ids = raw_lyric_ids[start_idx:end_idx]
-            if start_idx >= all_layers_matrix_lm.shape[-2]:  # Check text dim
-                return {
-                    "lm_score": 0.0,
-                    "dit_score": 0.0,
-                    "success": False,
-                    "error": "Lyrics indices out of bounds"
-                }
-
-            pure_matrix_lm = all_layers_matrix_lm[..., start_idx:end_idx, :]
-            pure_matrix_dit = all_layers_matrix_dit[..., start_idx:end_idx, :]
-
-            # Create aligner and calculate alignment info
-            aligner = MusicLyricScorer(self.text_tokenizer)
-
-            def calculate_single_score(matrix):
-                """Helper to run aligner on a matrix"""
-                info = aligner.lyrics_alignment_info(
-                    attention_matrix=matrix,
-                    token_ids=pure_lyric_ids,
-                    custom_config=custom_layers_config,
-                    return_matrices=False,
-                    medfilt_width=1,
-                )
-                if info.get("energy_matrix") is None:
-                    return 0.0
-
-                res = aligner.calculate_score(
-                    energy_matrix=info["energy_matrix"],
-                    type_mask=info["type_mask"],
-                    path_coords=info["path_coords"],
-                )
-                # Return the final score (check return key)
-                return res.get("lyrics_score", res.get("final_score", 0.0))
-
-            lm_score = calculate_single_score(pure_matrix_lm)
-            dit_score = calculate_single_score(pure_matrix_dit)
-
-            return {
-                "lm_score": lm_score,
-                "dit_score": dit_score,
-                "success": True,
-                "error": None
-            }
-
-        except Exception as e:
-            error_msg = f"Error generating score: {str(e)}"
-            logger.exception("[get_lyric_score] Failed")
-            return {
-                "lm_score": 0.0,
-                "dit_score": 0.0,
-                "success": False,
-                "error": error_msg
             }

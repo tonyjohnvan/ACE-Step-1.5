@@ -2,7 +2,8 @@
 setlocal enabledelayedexpansion
 REM ACE-Step Gradio Web UI Launcher - AMD ROCm 7.2
 REM For AMD RX 7000/6000 series GPUs on Windows 11
-REM Requires: Python 3.12, ROCm PyTorch from repo.radeon.com
+REM IMPORTANT: Requires Python 3.12 (AMD ROCm 7.2 only provides Python 3.12 wheels)
+REM Requires: ROCm PyTorch from repo.radeon.com
 
 REM ==================== Load .env Configuration ====================
 REM Load settings from .env file if it exists

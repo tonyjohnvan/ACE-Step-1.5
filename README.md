@@ -73,7 +73,9 @@ Star ACE-Step on GitHub and be instantly notified of new releases
 
 ## ⚡ Quick Start
 
-> **Requirements:** Python 3.11+, CUDA GPU recommended (also supports MPS / ROCm / Intel XPU / CPU)
+> **Requirements:** Python 3.11-3.12, CUDA GPU recommended (also supports MPS / ROCm / Intel XPU / CPU)
+> 
+> **Note:** ROCm on Windows requires Python 3.12 (AMD officially provides Python 3.12 wheels only)
 
 ```bash
 # 1. Install uv
