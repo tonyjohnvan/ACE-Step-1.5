@@ -14,11 +14,10 @@ dependencies = [
     "torch==2.10.0+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision==0.25.0+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchaudio==2.10.0+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    # PyTorch for Linux aarch64 (e.g. NVIDIA DGX Spark) -- pre-install for your CUDA version:
-    #   conda install pytorch torchvision torchaudio pytorch-cuda=13.0 -c pytorch-nightly -c nvidia
-    "torch>=2.4.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
-    "torchvision; sys_platform == 'linux' and platform_machine == 'aarch64'",
-    "torchaudio>=2.4.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    # PyTorch for Linux aarch64 with CUDA 13.0 (e.g. NVIDIA DGX Spark)
+    "torch==2.10.0+cu130; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torchvision==0.25.0+cu130; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torchaudio==2.10.0+cu130; sys_platform == 'linux' and platform_machine == 'aarch64'",
     # PyTorch for macOS (CPU / MPS)
     "torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "torchvision; sys_platform == 'darwin' and platform_machine == 'arm64'",
@@ -63,6 +62,11 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [tool.uv]
 required-environments = [
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
@@ -75,12 +79,15 @@ required-environments = [
 nano-vllm = { path = "acestep/third_parts/nano-vllm" }
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 torchvision = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 torchaudio = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 
 [project.scripts]
