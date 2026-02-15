@@ -56,6 +56,9 @@ _load_env_file() {
             LANGUAGE)
                 [[ -n "$value" ]] && LANGUAGE="$value"
                 ;;
+            ACESTEP_CONDA_ENV)
+                [[ -n "$value" ]] && ACESTEP_CONDA_ENV="$value"
+                ;;
         esac
     done < "$env_file"
     
@@ -190,6 +193,103 @@ _startup_update_check
 echo "Starting ACE-Step Gradio Web UI..."
 echo "Server will be available at: http://${SERVER_NAME}:${PORT}"
 echo
+
+# ==================== aarch64 / DGX Spark Support ====================
+# On aarch64 Linux (e.g. NVIDIA DGX Spark), CUDA PyTorch is only available
+# via conda -- no pip/uv wheels exist. Detect this and use conda directly.
+_ARCH="$(uname -m)"
+if [[ "$_ARCH" == "aarch64" && "$(uname -s)" == "Linux" ]]; then
+    echo "[Platform] aarch64 Linux detected (e.g. NVIDIA DGX Spark)"
+    echo "[Platform] CUDA PyTorch is not available via pip for this architecture."
+    echo "[Platform] Using conda environment instead of uv."
+    echo
+
+    # Accept env name from .env / env var, or detect active conda env
+    CONDA_ENV="${ACESTEP_CONDA_ENV:-${CONDA_DEFAULT_ENV:-}}"
+
+    if [[ -z "$CONDA_ENV" || "$CONDA_ENV" == "base" ]]; then
+        echo "========================================"
+        echo "  Conda environment required (aarch64)"
+        echo "========================================"
+        echo
+        echo "Please create and activate a conda env with CUDA PyTorch:"
+        echo
+        echo "  conda create -n ace python=3.11 -y"
+        echo "  conda activate ace"
+        echo "  conda install pytorch torchvision torchaudio pytorch-cuda=13.0 \\"
+        echo "      -c pytorch-nightly -c nvidia"
+        echo
+        echo "Then re-run this script:"
+        echo "  conda activate ace"
+        echo "  ./start_gradio_ui.sh"
+        echo
+        echo "Tip: set ACESTEP_CONDA_ENV=<name> in .env to use a specific env."
+        exit 1
+    fi
+
+    echo "[Platform] Using conda environment: $CONDA_ENV"
+
+    # Verify PyTorch has CUDA support
+    _torch_check="import torch; assert torch.cuda.is_available(), 'no CUDA'"
+    if [[ "$CONDA_DEFAULT_ENV" == "$CONDA_ENV" ]]; then
+        _PY=python
+    else
+        _PY="conda run --no-banner -n $CONDA_ENV python"
+    fi
+
+    if ! $_PY -c "$_torch_check" 2>/dev/null; then
+        echo
+        echo "WARNING: PyTorch in conda env '$CONDA_ENV' has no CUDA support."
+        echo "Install CUDA PyTorch:"
+        echo "  conda activate $CONDA_ENV"
+        echo "  conda install pytorch torchvision torchaudio pytorch-cuda=13.0 \\"
+        echo "      -c pytorch-nightly -c nvidia"
+        exit 1
+    fi
+
+    _cuda_ver=$($_PY -c "import torch; print(torch.version.cuda)" 2>/dev/null)
+    _gpu=$($_PY -c "import torch; print(torch.cuda.get_device_name(0))" 2>/dev/null)
+    echo "[Platform] CUDA ${_cuda_ver} | ${_gpu}"
+    echo
+
+    # Install project in editable mode if not already present
+    if ! $_PY -c "import acestep" 2>/dev/null; then
+        echo "[Setup] Installing ACE-Step into conda env '$CONDA_ENV'..."
+        $_PY -m pip install -e "$SCRIPT_DIR" --no-build-isolation --no-deps -q
+        # Also install nano-vllm for vllm backend
+        $_PY -m pip install -e "$SCRIPT_DIR/acestep/third_parts/nano-vllm" --no-build-isolation --no-deps -q 2>/dev/null
+        echo "[Setup] Done."
+        echo
+    fi
+
+    echo "Starting ACE-Step Gradio UI (conda)..."
+    echo
+
+    # Build command -- use active python directly or conda run
+    if [[ "$CONDA_DEFAULT_ENV" == "$CONDA_ENV" ]]; then
+        CMD="acestep"
+    else
+        CMD="conda run --no-banner -n $CONDA_ENV acestep"
+    fi
+    CMD="$CMD --port $PORT --server-name $SERVER_NAME --language $LANGUAGE"
+    [[ -n "$SHARE" ]] && CMD="$CMD $SHARE"
+    [[ -n "$CONFIG_PATH" ]] && CMD="$CMD $CONFIG_PATH"
+    [[ -n "$LM_MODEL_PATH" ]] && CMD="$CMD $LM_MODEL_PATH"
+    [[ -n "$OFFLOAD_TO_CPU" ]] && CMD="$CMD $OFFLOAD_TO_CPU"
+    [[ -n "$INIT_LLM" ]] && CMD="$CMD $INIT_LLM"
+    [[ -n "$DOWNLOAD_SOURCE" ]] && CMD="$CMD $DOWNLOAD_SOURCE"
+    [[ -n "$INIT_SERVICE" ]] && CMD="$CMD $INIT_SERVICE"
+    [[ -n "$ENABLE_API" ]] && CMD="$CMD $ENABLE_API"
+    [[ -n "$API_KEY" ]] && CMD="$CMD $API_KEY"
+    [[ -n "$AUTH_USERNAME" ]] && CMD="$CMD $AUTH_USERNAME"
+    [[ -n "$AUTH_PASSWORD" ]] && CMD="$CMD $AUTH_PASSWORD"
+
+    cd "$SCRIPT_DIR" && $CMD
+    exit $?
+fi
+
+# ==================== Standard uv Workflow ====================
+# (x86_64 Linux, Windows/WSL, macOS -- CUDA/MPS pip wheels available)
 
 # Check if uv is installed
 if ! command -v uv &>/dev/null; then
