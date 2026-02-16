@@ -7,9 +7,9 @@ requires-python = ">=3.11,<3.13"
 license = {text = "MIT"}
 dependencies = [
     # PyTorch for Windows with CUDA 12.8
-    "torch==2.7.1+cu128; sys_platform == 'win32'",
-    "torchvision==0.22.1+cu128; sys_platform == 'win32'",
-    "torchaudio==2.7.1+cu128; sys_platform == 'win32'",
+    "torch==2.10.0+cu128; sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "torchvision==0.25.0+cu128; sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "torchaudio==2.10.0+cu128; sys_platform == 'win32' and platform_machine == 'AMD64'",
     # PyTorch for Linux x86_64 with CUDA 12.8
     "torch==2.10.0+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision==0.25.0+cu128; sys_platform == 'linux' and platform_machine == 'x86_64'",
