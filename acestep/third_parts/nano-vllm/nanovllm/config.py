@@ -16,6 +16,12 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # Optional hard cap on KV cache allocation (in GB).  When set to a
+    # positive value, ``allocate_kv_cache`` will not allocate more than
+    # this amount regardless of ``gpu_memory_utilization``.  Useful for
+    # high-VRAM GPUs where the ratio-based allocation over-provisions the
+    # KV cache (e.g. 34 GB allocated when only 2 GB is needed).
+    max_kv_cache_gb: float = -1.0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

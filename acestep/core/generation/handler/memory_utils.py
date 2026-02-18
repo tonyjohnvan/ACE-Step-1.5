@@ -43,10 +43,16 @@ class MemoryUtilsMixin:
             return None
         return system_gb * 0.75
 
-    VAE_DECODE_MAX_CHUNK_SIZE = 512
+    VAE_DECODE_MAX_CHUNK_SIZE = 4608
 
     def _get_auto_decode_chunk_size(self) -> int:
-        """Choose a conservative VAE decode chunk size based on available memory."""
+        """Choose VAE decode chunk size based on available memory.
+
+        Larger chunks reduce tiling overhead (fewer kernel launches and
+        boundary stitching) and significantly improve throughput on
+        high-VRAM GPUs. The old hard cap of 512 caused a 12-chunk decode
+        on a 121 GB GPU when 3 chunks (or even a single pass) would suffice.
+        """
         override = os.environ.get("ACESTEP_VAE_DECODE_CHUNK_SIZE")
         if override:
             try:
@@ -73,6 +79,15 @@ class MemoryUtilsMixin:
             except Exception:
                 free_gb = 0
             logger.debug(f"[_get_auto_decode_chunk_size] Effective free VRAM: {free_gb:.2f} GB")
+            # Scale chunk size with available VRAM.  Larger chunks =
+            # fewer tiling iterations = less overhead.  A single VAE
+            # decode chunk of 4500 frames (typical full song) needs
+            # ~2-3 GB peak activation memory on CUDA (bf16).
+            # Only unlock large chunks for very-high-VRAM GPUs (e.g. DGX
+            # Spark with 121 GB).  Consumer GPUs keep the battle-tested
+            # conservative values to avoid OOM regressions.
+            if free_gb >= 32.0:
+                return min(4608, max_chunk)   # full song in one pass
             if free_gb >= 24.0:
                 return min(512, max_chunk)
             if free_gb >= 16.0:

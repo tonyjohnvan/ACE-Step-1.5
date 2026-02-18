@@ -694,7 +694,18 @@ class LLMHandler:
             else:
                 self.max_model_len = 4096
 
-            logger.info(f"Initializing 5Hz LM with model: {model_path}, enforce_eager: {enforce_eager}, tensor_parallel_size: 1, max_model_len: {self.max_model_len}, gpu_memory_utilization: {gpu_memory_utilization:.3f}")
+            # Compute a hard cap on KV cache allocation so nanovllm does
+            # not over-provision on high-VRAM GPUs where the ratio-based
+            # math is misleading (gpu_config sees system-wide usage but
+            # nanovllm only sees its own).
+            from acestep.gpu_config import LM_VRAM, get_lm_model_size
+            _model_size = get_lm_model_size(model_path)
+            _lm_info = LM_VRAM.get(_model_size, LM_VRAM["0.6B"])
+            _kv_key = "kv_cache_2k" if self.max_model_len <= 2048 else "kv_cache_4k"
+            # 2x headroom on top of empirical KV cache estimate for safety
+            max_kv_cache_gb = _lm_info[_kv_key] * 2.0 + 0.5
+
+            logger.info(f"Initializing 5Hz LM with model: {model_path}, enforce_eager: {enforce_eager}, tensor_parallel_size: 1, max_model_len: {self.max_model_len}, gpu_memory_utilization: {gpu_memory_utilization:.3f}, max_kv_cache_gb: {max_kv_cache_gb:.1f}")
             start_time = time.time()
             self.llm = LLM(
                 model=model_path,
@@ -703,6 +714,7 @@ class LLMHandler:
                 max_model_len=self.max_model_len,
                 gpu_memory_utilization=gpu_memory_utilization,
                 tokenizer=self.llm_tokenizer,
+                max_kv_cache_gb=max_kv_cache_gb,
             )
             logger.info(f"5Hz LM initialized successfully in {time.time() - start_time:.2f} seconds")
             self.llm_initialized = True

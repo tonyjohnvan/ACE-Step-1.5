@@ -269,6 +269,19 @@ class ModelRunner:
         max_kv_from_free = max(0, free - MIN_RESERVE_BYTES) * 0.9
         available_for_kv_cache = min(available_for_kv_cache, max_kv_from_free)
         
+        # Honour explicit max_kv_cache_gb cap.  On high-VRAM GPUs (e.g. 121 GB
+        # DGX Spark) the ratio-based calculation can over-provision the KV cache
+        # (34 GB allocated when only ~2 GB is actually needed for max_model_len
+        # tokens × max_num_seqs concurrency), wasting init time and VRAM.
+        if config.max_kv_cache_gb > 0:
+            cap_bytes = config.max_kv_cache_gb * (1024**3)
+            if available_for_kv_cache > cap_bytes:
+                print(
+                    f"[nanovllm] KV cache capped by max_kv_cache_gb={config.max_kv_cache_gb:.1f} GB "
+                    f"(was {available_for_kv_cache / 1024**3:.2f} GB)"
+                )
+                available_for_kv_cache = cap_bytes
+        
         # Ensure we have positive memory available
         if available_for_kv_cache <= 0:
             available_for_kv_cache = free * 0.5  # Fallback to 50% of free memory
@@ -554,13 +567,12 @@ class ModelRunner:
                 # Apply logits processor for constrained decoding (if any sequence has one)
                 for i, seq in enumerate(cond_seqs):
                     if seq.logits_processor is not None:
-                        # Create input_ids tensor for this sequence
-                        seq_input_ids = torch.tensor([seq.token_ids], device=logits_cfg.device)
+                        # Re-use pre-allocated pinned buffer for token_ids transfer
+                        n = len(seq.token_ids)
+                        self._seq_token_ids_buffer[0, :n] = torch.tensor(seq.token_ids, dtype=torch.int64)
+                        seq_input_ids = self._seq_token_ids_buffer[0:1, :n].cuda(non_blocking=True)
                         # Apply processor to this sequence's logits
                         logits_cfg[i:i+1] = seq.logits_processor(seq_input_ids, logits_cfg[i:i+1])
-                
-                # Prepare input_ids for sampler (for repetition penalty, though we already applied it)
-                # cond_input_ids = torch.tensor([seq.token_ids for seq in cond_seqs], device=logits_cfg.device)
                 
                 # Sample from CFG logits
                 token_ids_cfg = self.sampler(
@@ -601,11 +613,14 @@ class ModelRunner:
                         penalty = repetition_penalties[i].item()
                         if penalty != 1.0:
                             # Only penalize completion tokens (not prompt tokens)
-                            completion_tokens = torch.tensor(seq.completion_token_ids, device=logits.device)
+                            completion_tokens = seq.completion_token_ids
                             if len(completion_tokens) > 0:
+                                n = len(completion_tokens)
+                                self._seq_token_ids_buffer[0, :n] = torch.tensor(completion_tokens, dtype=torch.int64)
+                                comp_gpu = self._seq_token_ids_buffer[0, :n].cuda(non_blocking=True)
                                 # Create token mask: mark tokens that appeared in completion
                                 token_mask = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
-                                token_mask[completion_tokens] = True
+                                token_mask[comp_gpu] = True
                                 
                                 # Apply standard repetition penalty formula (matching transformers implementation):
                                 # For tokens in completion: if score < 0 then score * penalty, else score / penalty
@@ -618,18 +633,18 @@ class ModelRunner:
                                 logits[i] = torch.where(token_mask, penalty_scores, logits[i])
                 
                 # Apply logits processor for constrained decoding (if any sequence has one)
-                # Clone logits to avoid in-place update issues in inference mode
+                # Clone to avoid in-place update issues in inference mode
                 logits = logits.clone()
                 for i, seq in enumerate(seqs):
                     if seq.logits_processor is not None:
-                        # Create input_ids tensor for this sequence
-                        seq_input_ids = torch.tensor([seq.token_ids], device=logits.device)
-                        # Apply processor to this sequence's logits (clone to avoid inference mode issues)
-                        processed = seq.logits_processor(seq_input_ids, logits[i:i+1].clone())
+                        # Re-use pre-allocated pinned buffer for token_ids
+                        # transfer instead of creating a new GPU tensor every step
+                        n = len(seq.token_ids)
+                        self._seq_token_ids_buffer[0, :n] = torch.tensor(seq.token_ids, dtype=torch.int64)
+                        seq_input_ids = self._seq_token_ids_buffer[0:1, :n].cuda(non_blocking=True)
+                        # Apply processor to this sequence's logits
+                        processed = seq.logits_processor(seq_input_ids, logits[i:i+1])
                         logits[i] = processed[0]
-                
-                # Prepare input_ids for sampler
-                # seq_input_ids = torch.tensor([seq.token_ids for seq in seqs], device=logits.device)
                 
                 token_ids = self.sampler(
                     logits, 
@@ -637,7 +652,6 @@ class ModelRunner:
                     top_ks=top_ks if top_ks is not None else None,
                     top_ps=top_ps if top_ps is not None else None,
                     repetition_penalties=None,  # Already applied above
-                    # input_ids=seq_input_ids,
                 ).tolist()
                 
                 # Update logits processor state after sampling
