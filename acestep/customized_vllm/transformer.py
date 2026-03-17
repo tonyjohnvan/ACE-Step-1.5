@@ -94,21 +94,33 @@ def _sdpa_packed_prefill(q, k, v, cu_q, cu_k, scale, n_heads, n_kv):
 
 
 def _sdpa_cached_decode(q, k_cache, v_cache, ctx_lens, block_tbl, scale, n_heads, n_kv):
+    """Batched SDPA decode: single attention call for all sequences."""
     blk_sz = k_cache.shape[1]
-    results = []
+    B = q.shape[0]
+    head_dim = k_cache.shape[-1]
     gqa = n_heads != n_kv
-    for i in range(q.shape[0]):
-        cl = ctx_lens[i].item()
-        nb = (cl + blk_sz - 1) // blk_sz
-        idx = block_tbl[i, :nb]
-        ki = k_cache[idx].reshape(-1, n_kv, k_cache.shape[-1])[:cl]
-        vi = v_cache[idx].reshape(-1, n_kv, v_cache.shape[-1])[:cl]
-        qi = q[i].unsqueeze(0).transpose(1, 2)
-        ki = ki.unsqueeze(0).transpose(1, 2)
-        vi = vi.unsqueeze(0).transpose(1, 2)
-        oi = F.scaled_dot_product_attention(qi, ki, vi, scale=scale, is_causal=False, enable_gqa=gqa)
-        results.append(oi.transpose(1, 2).squeeze(0))
-    return torch.stack(results, dim=0)
+    max_cl = ctx_lens.max().item()  # single CPU sync (was per-sequence)
+    max_nb = (max_cl + blk_sz - 1) // blk_sz
+
+    # Gather KV from paged cache in one operation
+    idx = block_tbl[:, :max_nb].clamp(min=0)       # (B, max_nb)
+    ki = k_cache[idx].reshape(B, -1, n_kv, head_dim)[:, :max_cl]   # (B, max_cl, n_kv, D)
+    vi = v_cache[idx].reshape(B, -1, n_kv, head_dim)[:, :max_cl]
+
+    # Transpose to (B, heads, seq, D) for SDPA
+    qi = q.unsqueeze(1).transpose(1, 2)             # (B, n_heads, 1, D)
+    ki = ki.transpose(1, 2)                          # (B, n_kv, max_cl, D)
+    vi = vi.transpose(1, 2)
+
+    # Build padding mask: True where position >= ctx_len (padded positions)
+    positions = torch.arange(max_cl, device=q.device).unsqueeze(0)  # (1, max_cl)
+    pad_mask = positions >= ctx_lens.unsqueeze(1)                    # (B, max_cl)
+    float_mask = torch.zeros(B, 1, 1, max_cl, device=q.device, dtype=qi.dtype)
+    float_mask.masked_fill_(pad_mask.unsqueeze(1).unsqueeze(1), float('-inf'))
+
+    oi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=float_mask,
+                                        scale=scale, is_causal=False, enable_gqa=gqa)
+    return oi.transpose(1, 2).squeeze(2)             # (B, n_heads, D)
 
 
 # ---------------------------------------------------------------------------
