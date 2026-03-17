@@ -136,6 +136,7 @@ class InferencePipeline:
             "positions": torch.zeros(bs, **pin_i64),
             "slots": torch.zeros(bs, **pin_i32),
             "ctx_lens": torch.zeros(bs, **pin_i32),
+            "block_tables": torch.full((bs, max_blocks), -1, **pin_i32),
         }
 
     # -- Warmup & KV storage ---------------------------------------------
@@ -197,9 +198,14 @@ class InferencePipeline:
     # -- Input preparation -----------------------------------------------
 
     def _build_cache_index(self, slots):
+        n = len(slots)
         max_len = max(len(s.cache_blocks) for s in slots)
-        rows = [s.cache_blocks + [-1] * (max_len - len(s.cache_blocks)) for s in slots]
-        return torch.tensor(rows, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        bt = self._xfer["block_tables"]
+        bt[:n, :max_len].fill_(-1)
+        for i, s in enumerate(slots):
+            for j, bid in enumerate(s.cache_blocks):
+                bt[i, j] = bid
+        return bt[:n, :max_len].cuda(non_blocking=True)
 
     def _execute_prefill(self, slots):
         """Prepare prefill inputs and run model forward, returning logits."""
@@ -331,17 +337,20 @@ class InferencePipeline:
     def _penalize_repetitions(self, logits, slots, penalties):
         if penalties is None:
             return logits
+        needs = (penalties != 1.0)
+        if not needs.any():
+            return logits
+        B, V = logits.shape
+        mask = torch.zeros(B, V, dtype=torch.bool, device=logits.device)
         for i, slot in enumerate(slots):
-            p = penalties[i].item()
-            if p == 1.0:
-                continue
-            comp = torch.tensor(slot.generated_ids, device=logits.device)
-            if len(comp) == 0:
-                continue
-            mask = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
-            mask[comp] = True
-            penalized = torch.where(logits[i] < 0, logits[i] * p, logits[i] / p)
-            logits[i] = torch.where(mask, penalized, logits[i])
+            gen = slot.generated_ids
+            if gen:
+                mask[i, torch.tensor(gen, device=logits.device)] = True
+        if not mask.any():
+            return logits
+        p = penalties.unsqueeze(1)  # (B, 1) for broadcasting
+        penalized = torch.where(logits < 0, logits * p, logits / p)
+        logits = torch.where(needs.unsqueeze(1) & mask, penalized, logits)
         return logits
 
     # -- Main step -------------------------------------------------------
@@ -359,8 +368,8 @@ class InferencePipeline:
             if is_cfg:
                 nc = len(slots) // 2
                 cond, uncond = logits[:nc], logits[nc:]
-                cond = self._penalize_repetitions(cond, slots[:nc], rep_pen)
                 cfg_logits = uncond + cfg_s.unsqueeze(1) * (cond - uncond)
+                cfg_logits = self._penalize_repetitions(cfg_logits, slots[:nc], rep_pen)
                 cfg_logits = self._constrain_logits(cfg_logits, slots[:nc])
                 tids = sample_tokens(cfg_logits, temps, topk, topp).tolist()
                 if slots[0].logits_processor_update_state:
@@ -379,6 +388,68 @@ class InferencePipeline:
                   f"(prefill={is_prefill}, n_slots={len(slots)}):\n"
                   f"{traceback.format_exc()}", file=sys.stderr, flush=True)
             raise
+
+    def execute_step_with_sharing(self, slots, prefix_groups, is_prefill):
+        """Prefill with prefix sharing: prefill only templates + non-shared slots,
+        broadcast logits to aliases, then sample all slots normally.
+
+        Args:
+            slots: ordered batch (normal + cond + uncond)
+            prefix_groups: list of (template_slot, [alias_slots])
+            is_prefill: must be True (sharing only applies to prefill)
+        """
+        from acestep.customized_vllm import reset_context
+
+        # Build lookup: alias id -> template slot
+        alias_to_template = {}
+        for template, aliases in prefix_groups:
+            for s in aliases:
+                alias_to_template[id(s)] = template
+
+        # Slots that need actual prefill = everything except aliases
+        prefill_slots = [s for s in slots if id(s) not in alias_to_template]
+
+        # Prefill only non-alias slots (templates + any non-grouped slots)
+        prefill_logits = self._execute_prefill(prefill_slots)
+        reset_context()
+
+        # Map each prefill slot to its row in prefill_logits
+        prefill_row = {id(s): row for row, s in enumerate(prefill_slots)}
+
+        # Build full logits tensor by broadcasting template rows to aliases
+        n = len(slots)
+        V = prefill_logits.shape[1]
+        full_logits = torch.empty(n, V, device=prefill_logits.device,
+                                  dtype=prefill_logits.dtype)
+        for i, s in enumerate(slots):
+            sid = id(s)
+            if sid in prefill_row:
+                full_logits[i] = prefill_logits[prefill_row[sid]]
+            else:
+                template = alias_to_template[sid]
+                full_logits[i] = prefill_logits[prefill_row[id(template)]]
+
+        # Sampling — identical to execute_step from here
+        is_cfg = slots[0].cfg_scale > 1.0 and slots[0].paired_slot is not None
+        temps, cfg_s, topk, topp, rep_pen = self._gather_sampling_config(slots, is_cfg)
+
+        if is_cfg:
+            nc = n // 2
+            cond, uncond = full_logits[:nc], full_logits[nc:]
+            cfg_logits = uncond + cfg_s.unsqueeze(1) * (cond - uncond)
+            cfg_logits = self._penalize_repetitions(cfg_logits, slots[:nc], rep_pen)
+            cfg_logits = self._constrain_logits(cfg_logits, slots[:nc])
+            tids = sample_tokens(cfg_logits, temps, topk, topp).tolist()
+            if slots[0].logits_processor_update_state:
+                slots[0].logits_processor_update_state(tids[0])
+            return tids
+
+        full_logits = self._penalize_repetitions(full_logits, slots, rep_pen)
+        full_logits = self._constrain_logits(full_logits.clone(), slots)
+        tids = sample_tokens(full_logits, temps, topk, topp).tolist()
+        if slots and slots[0].logits_processor_update_state:
+            slots[0].logits_processor_update_state(tids[0])
+        return tids
 
     # -- CUDA graph capture ----------------------------------------------
 
