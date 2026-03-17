@@ -315,12 +315,31 @@ class InferencePipeline:
         Only the first slot's processor is invoked (since all batch slots
         share the same processor instance and identical token histories).
         The constrained result is broadcast to remaining slots.
+        Uses a pre-allocated GPU buffer to avoid per-step tensor creation.
         """
         if not slots or slots[0].logits_processor is None:
             return logits
         try:
-            processor = slots[0].logits_processor
-            ids_t = torch.tensor([slots[0].token_ids], device=logits.device)
+            slot = slots[0]
+            processor = slot.logits_processor
+            n = len(slot.token_ids)
+            buf = slot._gpu_ids_buf
+            if buf is None:
+                # First call: allocate buffer for full generation lifetime
+                max_len = slot.prompt_length + slot.max_tokens
+                slot._gpu_ids_buf = torch.zeros(1, max_len, device=logits.device,
+                                                dtype=torch.int64)
+                slot._gpu_ids_buf[0, :n] = torch.tensor(
+                    slot.token_ids, device=logits.device, dtype=torch.int64)
+                slot._gpu_ids_len = n
+                buf = slot._gpu_ids_buf
+            elif slot._gpu_ids_len < n:
+                # Append only new tokens (typically 1 per decode step)
+                old = slot._gpu_ids_len
+                buf[0, old:n] = torch.tensor(
+                    slot.token_ids[old:n], device=logits.device, dtype=torch.int64)
+                slot._gpu_ids_len = n
+            ids_t = buf[:, :n]
             processed = processor(ids_t, logits[0:1].clone())
             logits[0] = processed[0]
             for i in range(1, len(slots)):
