@@ -130,6 +130,9 @@ class GenerationSlot:
         # must not be returned to the pool by this slot.
         self._owned_start: int = 0
         self._is_prefix_template: bool = False
+        # Pre-allocated GPU buffer for _constrain_logits (avoids per-step alloc)
+        self._gpu_ids_buf: torch.Tensor | None = None
+        self._gpu_ids_len: int = 0
 
     def __len__(self):
         return self.num_tokens
