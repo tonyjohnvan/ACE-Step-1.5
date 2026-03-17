@@ -126,6 +126,10 @@ class GenerationSlot:
         self.logits_processor_update_state: Optional[Callable[[int], None]] = (
             params.logits_processor_update_state
         )
+        # Prefix caching: blocks before _owned_start are shared (aliased) and
+        # must not be returned to the pool by this slot.
+        self._owned_start: int = 0
+        self._is_prefix_template: bool = False
 
     def __len__(self):
         return self.num_tokens
@@ -160,28 +164,45 @@ class GenerationSlot:
 # ---------------------------------------------------------------------------
 
 class CachePool:
-    """Simple block-based KV cache allocator (no prefix caching)."""
+    """Block-based KV cache allocator with reference-counted prefix sharing."""
 
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.available: deque[int] = deque(range(num_blocks))
         self.total = num_blocks
+        self._refcount: dict[int, int] = {}
 
     def has_capacity(self, num_blocks: int) -> bool:
         return len(self.available) >= num_blocks
 
     def reserve(self, slot: GenerationSlot):
         for _ in range(slot.required_blocks):
-            slot.cache_blocks.append(self.available.popleft())
+            bid = self.available.popleft()
+            slot.cache_blocks.append(bid)
+            self._refcount[bid] = self._refcount.get(bid, 0) + 1
+
+    def alias_blocks(self, source: GenerationSlot, target: GenerationSlot):
+        """Share source's prompt blocks with target (read-only alias)."""
+        for bid in source.cache_blocks:
+            target.cache_blocks.append(bid)
+            self._refcount[bid] = self._refcount.get(bid, 0) + 1
+        target._owned_start = len(target.cache_blocks)
 
     def release(self, slot: GenerationSlot):
         for bid in reversed(slot.cache_blocks):
-            self.available.append(bid)
+            rc = self._refcount.get(bid, 1) - 1
+            if rc <= 0:
+                self.available.append(bid)
+                self._refcount.pop(bid, None)
+            else:
+                self._refcount[bid] = rc
         slot.cache_blocks.clear()
 
     def grow_if_needed(self, slot: GenerationSlot):
         if len(slot) % self.block_size == 1 and len(slot) > slot.prompt_length:
-            slot.cache_blocks.append(self.available.popleft())
+            bid = self.available.popleft()
+            slot.cache_blocks.append(bid)
+            self._refcount[bid] = 1
 
 
 # ---------------------------------------------------------------------------
@@ -270,35 +291,64 @@ class LLM:
     # -- Internal generation logic ----------------------------------------
 
     def _prepare_slots(self, prompts, sampling_params, unconditional_prompts):
-        """Tokenise prompts, create slots, allocate KV cache."""
+        """Tokenise prompts, create slots, allocate KV cache with prefix sharing."""
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         if unconditional_prompts is None:
             unconditional_prompts = [None] * len(prompts)
 
         all_slots = []
+        cond_slots = []
+        uncond_slots = []
         for prompt, sp, uncond in zip(prompts, sampling_params, unconditional_prompts):
             ids = self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
             cond = GenerationSlot(ids, sp)
+            cond_slots.append(cond)
             if sp.cfg_scale > 1.0:
                 u_ids = (self.tokenizer.encode(uncond) if isinstance(uncond, str)
                          else (uncond if uncond is not None else ids))
                 uncond_slot = GenerationSlot(u_ids, sp, is_unconditional=True)
                 cond.paired_slot = uncond_slot
                 uncond_slot.paired_slot = cond
+                uncond_slots.append(uncond_slot)
                 all_slots.extend([cond, uncond_slot])
             else:
                 all_slots.append(cond)
 
-        total_blocks = sum(s.required_blocks for s in all_slots)
-        if not self._cache.has_capacity(total_blocks):
+        # Prefix sharing: detect groups of slots with identical prompts.
+        # Allocate blocks for one template per group; alias to the rest.
+        self._prefix_groups = []  # [(template, [aliases])]
+        for group in (cond_slots, uncond_slots):
+            if len(group) < 2:
+                continue
+            first = tuple(group[0].token_ids)
+            if all(tuple(s.token_ids) == first for s in group):
+                template = group[0]
+                template._is_prefix_template = True
+                self._prefix_groups.append((template, group[1:]))
+
+        # Calculate blocks needed: templates get full allocation,
+        # aliases get aliased blocks (no extra pool consumption).
+        aliased = {id(s) for _, aliases in self._prefix_groups for s in aliases}
+        blocks_needed = sum(s.required_blocks for s in all_slots if id(s) not in aliased)
+        if not self._cache.has_capacity(blocks_needed):
             raise RuntimeError(
-                f"Insufficient KV cache: need {total_blocks} blocks, "
+                f"Insufficient KV cache: need {blocks_needed} blocks, "
                 f"have {len(self._cache.available)}/{self._cache.total}"
             )
+
+        # Allocate: templates first, then alias, then remaining slots.
+        for template, aliases in self._prefix_groups:
+            self._cache.reserve(template)
+            template.status = SlotStatus.ACTIVE
+            for s in aliases:
+                self._cache.alias_blocks(template, s)
+                s.status = SlotStatus.ACTIVE
         for slot in all_slots:
-            self._cache.reserve(slot)
-            slot.status = SlotStatus.ACTIVE
+            if slot.status != SlotStatus.ACTIVE:
+                self._cache.reserve(slot)
+                slot.status = SlotStatus.ACTIVE
+
         self._active_slots = list(all_slots)
         return all_slots
 
@@ -313,7 +363,12 @@ class LLM:
         """Generator yielding (ordered_batch, token_ids, elapsed, is_prefill) per step."""
         ordered = self._arrange_guidance_batch(all_slots)
         t = perf_counter()
-        tids = self._pipeline.execute_step(ordered, is_prefill=True)
+        prefix_groups = getattr(self, '_prefix_groups', [])
+        if prefix_groups:
+            tids = self._pipeline.execute_step_with_sharing(
+                ordered, prefix_groups, is_prefill=True)
+        else:
+            tids = self._pipeline.execute_step(ordered, is_prefill=True)
         yield ordered, tids, perf_counter() - t, True
 
         while self._active_slots:
