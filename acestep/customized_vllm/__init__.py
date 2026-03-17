@@ -263,6 +263,7 @@ class LLM:
             max_model_len=cfg.max_model_len,
             gpu_memory_utilization=cfg.gpu_memory_utilization,
             enforce_eager=cfg.enforce_eager,
+            quantization=kwargs.get("quantization", None),
         )
         tok = kwargs.get("tokenizer", None)
         self.tokenizer = tok if tok is not None else AutoTokenizer.from_pretrained(model, use_fast=True)
@@ -270,6 +271,37 @@ class LLM:
         self._cache = CachePool(self._pipeline._num_cache_blocks, cfg.kvcache_block_size)
         self._active_slots: list[GenerationSlot] = []
         atexit.register(self.exit)
+
+        # Discover audio code token range for vocab restriction
+        self._audio_vocab_range = self._discover_audio_code_range()
+
+    def _discover_audio_code_range(self):
+        """Find the contiguous token ID range for audio codes + EOS.
+
+        Returns (start, end) where start = min(eos_id, first_audio_code) and
+        end = last_audio_code + 1, or None if audio codes not found.
+        """
+        tok = self.tokenizer
+        first_audio = tok.convert_tokens_to_ids("<|audio_code_0|>")
+        if first_audio is None or first_audio == tok.unk_token_id:
+            return None
+        # Audio codes are contiguous: <|audio_code_0|> through <|audio_code_N|>
+        # EOS (<|im_end|>) is typically just below the audio code range.
+        eos_id = self._eos
+        start = min(eos_id, first_audio) if eos_id is not None else first_audio
+        end = self._cfg.hf_config.vocab_size  # includes all audio codes
+        print(f"[customized_vllm] Audio vocab range: [{start}, {end}) "
+              f"= {end - start} tokens (full vocab: {end}, EOS: {eos_id})")
+        return (start, end)
+
+    def set_active_vocab_for_codes(self):
+        """Activate restricted lm_head for audio codes phase (3.3x less lm_head compute)."""
+        if self._audio_vocab_range is not None:
+            self._pipeline.set_active_vocab(*self._audio_vocab_range)
+
+    def clear_active_vocab(self):
+        """Deactivate restricted lm_head — use full vocabulary."""
+        self._pipeline.clear_active_vocab()
 
     def exit(self):
         self._pipeline.shutdown()
@@ -423,14 +455,19 @@ class LLM:
         all_slots = self._prepare_slots(prompts, sampling_params, unconditional_prompts)
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True) if use_tqdm else None
         prefill_tps = decode_tps = 0.0
+        decode_steps = 0
+        t_total = perf_counter()
+        t_prefill = 0.0
         outputs = {}
 
         try:
             for batch, token_ids, elapsed, is_pf in self._generation_steps(all_slots):
                 elapsed = max(elapsed, 1e-9)
                 if is_pf:
+                    t_prefill = elapsed
                     prefill_tps = sum(len(s) for s in batch) / elapsed
                 else:
+                    decode_steps += 1
                     n_cond = sum(1 for s in batch if not s.is_unconditional)
                     decode_tps = n_cond / elapsed
 
@@ -446,6 +483,13 @@ class LLM:
         finally:
             if pbar:
                 pbar.close()
+
+        total_elapsed = perf_counter() - t_total
+        vocab_info = (f", vocab_restricted=[{self._pipeline._vocab_range[0]}:{self._pipeline._vocab_range[1]})"
+                      if self._pipeline._vocab_range else "")
+        print(f"[customized_vllm] Generation done: {total_elapsed:.2f}s total "
+              f"(prefill={t_prefill:.3f}s @ {int(prefill_tps)}tok/s, "
+              f"decode={decode_steps}steps @ {int(decode_tps)}tok/s{vocab_info})")
 
         result = [outputs[sid] for sid in sorted(outputs)]
         return [{"text": self.tokenizer.decode(tids), "token_ids": tids} for tids in result]

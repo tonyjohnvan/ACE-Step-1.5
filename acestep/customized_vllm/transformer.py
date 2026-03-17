@@ -376,12 +376,19 @@ class CausalTransformer(nn.Module):
         h, _ = self.norm(h, residual)
         return h
 
-    def project_to_vocab(self, hidden_states):
-        """Extract last-token hidden states (during prefill) and project to vocabulary logits."""
+    def project_to_vocab(self, hidden_states, vocab_range=None):
+        """Extract last-token hidden states (during prefill) and project to vocabulary logits.
+
+        Args:
+            vocab_range: Optional (start, end) tuple to restrict lm_head to a contiguous
+                         token ID slice. Reduces matmul from full vocab to (end-start) tokens.
+        """
         from acestep.customized_vllm import _get_forward_state
         state = _get_forward_state()
         if state.is_prefill:
             hidden_states = hidden_states[state.cu_seqlens_q[1:] - 1].contiguous()
+        if vocab_range is not None:
+            return F.linear(hidden_states, self.lm_head.weight[vocab_range[0]:vocab_range[1]])
         return self.lm_head(hidden_states)
 
 

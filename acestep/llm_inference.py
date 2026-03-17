@@ -840,25 +840,33 @@ class LLMHandler:
             logits_processor_update_state=constrained_processor.update_state if constrained_processor else None,
         )
 
-        if cfg_scale > 1.0:
-            # Build unconditional prompt based on generation phase
-            formatted_unconditional_prompt = self._build_unconditional_prompt(
-                caption=caption,
-                lyrics=lyrics,
-                cot_text=cot_text,
-                negative_prompt=negative_prompt,
-                generation_phase=generation_phase,
-                is_batch=is_batch,
-            )
-            unconditional_prompts = [formatted_unconditional_prompt] * batch_size
+        # Restrict lm_head to audio code tokens during codes phase (3.3x less compute)
+        if generation_phase == "codes" and hasattr(self.llm, 'set_active_vocab_for_codes'):
+            self.llm.set_active_vocab_for_codes()
 
-            outputs = self.llm.generate(
-                formatted_prompt_list,
-                sampling_params,
-                unconditional_prompts=unconditional_prompts,
-            )
-        else:
-            outputs = self.llm.generate(formatted_prompt_list, sampling_params)
+        try:
+            if cfg_scale > 1.0:
+                # Build unconditional prompt based on generation phase
+                formatted_unconditional_prompt = self._build_unconditional_prompt(
+                    caption=caption,
+                    lyrics=lyrics,
+                    cot_text=cot_text,
+                    negative_prompt=negative_prompt,
+                    generation_phase=generation_phase,
+                    is_batch=is_batch,
+                )
+                unconditional_prompts = [formatted_unconditional_prompt] * batch_size
+
+                outputs = self.llm.generate(
+                    formatted_prompt_list,
+                    sampling_params,
+                    unconditional_prompts=unconditional_prompts,
+                )
+            else:
+                outputs = self.llm.generate(formatted_prompt_list, sampling_params)
+        finally:
+            if hasattr(self.llm, 'clear_active_vocab'):
+                self.llm.clear_active_vocab()
 
         # Extract text from outputs
         output_texts = []

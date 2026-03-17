@@ -74,7 +74,7 @@ class InferencePipeline:
 
     def __init__(self, hf_config, model_path: str, block_size: int, max_num_seqs: int,
                  max_num_batched_tokens: int, max_model_len: int, gpu_memory_utilization: float,
-                 enforce_eager: bool):
+                 enforce_eager: bool, quantization: str | None = None):
         torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.config.verbose = True
         self.block_size = block_size
@@ -84,6 +84,10 @@ class InferencePipeline:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.gpu_memory_utilization = gpu_memory_utilization
         self.hf_config = hf_config
+
+        # Vocab restriction state (set via set_active_vocab / clear_active_vocab)
+        self._vocab_range: tuple[int, int] | None = None
+        self._full_logits_buf: torch.Tensor | None = None
 
         torch.cuda.set_device(0)
         saved_dtype = torch.get_default_dtype()
@@ -107,6 +111,9 @@ class InferencePipeline:
         load_weights(self.model, model_path)
         debug_end("load_model", _t, prefix="tensor.vllm")
 
+        if quantization:
+            self._apply_quantization(quantization)
+
         self._init_transfer_buffers()
         self._warmup_pipeline()
         self._provision_kv_storage()
@@ -115,6 +122,54 @@ class InferencePipeline:
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(saved_dtype)
+
+    # -- Quantization ----------------------------------------------------
+
+    def _apply_quantization(self, method: str):
+        """Apply post-load weight quantization. Currently supports 'int8' via torchao."""
+        if method == "int8":
+            try:
+                from torchao.quantization import quantize_, int8_weight_only
+                # Skip embedding (nn.Embedding) — only quantize nn.Linear layers.
+                # Tied lm_head uses embedding weight via F.linear, so it stays in
+                # original dtype (the matmul is smaller after vocab restriction anyway).
+                quantize_(self.model, int8_weight_only())
+                print(f"[customized_vllm] INT8 weight-only quantization applied")
+            except ImportError:
+                print(f"[customized_vllm] torchao not installed — skipping INT8 quantization. "
+                      f"Install with: pip install torchao")
+        else:
+            print(f"[customized_vllm] Unknown quantization method: {method!r}")
+
+    # -- Vocab restriction -----------------------------------------------
+
+    def set_active_vocab(self, start_id: int, end_id: int):
+        """Restrict lm_head to a contiguous token ID range [start_id, end_id).
+
+        During codes phase, this avoids computing logits for the entire 217K vocab
+        when only ~65K audio code tokens are valid (3.3x less lm_head compute).
+        Restricted logits are expanded back to full vocab for processor compatibility.
+        """
+        self._vocab_range = (start_id, end_id)
+
+    def clear_active_vocab(self):
+        """Remove vocab restriction — compute full-vocab logits."""
+        self._vocab_range = None
+
+    def _expand_restricted_logits(self, restricted, bs):
+        """Scatter restricted logits into a full-vocab tensor (fill rest with -inf)."""
+        full_v = self.hf_config.vocab_size
+        buf = self._full_logits_buf
+        if buf is None or buf.size(0) < bs or buf.size(1) != full_v:
+            self._full_logits_buf = torch.full(
+                (max(bs, self.max_num_seqs), full_v),
+                float('-inf'), device='cuda', dtype=self.dtype)
+            buf = self._full_logits_buf
+        out = buf[:bs]
+        out.fill_(float('-inf'))
+        start, end = self._vocab_range
+        out[:, start:end] = restricted
+        return out
 
     # -- Transfer buffers ------------------------------------------------
 
@@ -261,8 +316,14 @@ class InferencePipeline:
     @torch.inference_mode()
     def _forward_pass(self, input_ids, positions, is_prefill):
         from acestep.customized_vllm import _get_forward_state
+        vr = self._vocab_range  # None or (start, end) for restricted lm_head
+
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.project_to_vocab(self.model(input_ids, positions))
+            logits = self.model.project_to_vocab(
+                self.model(input_ids, positions), vocab_range=vr)
+            if vr is not None:
+                return self._expand_restricted_logits(logits, logits.size(0))
+            return logits
 
         bs = input_ids.size(0)
         state = _get_forward_state()
@@ -270,7 +331,11 @@ class InferencePipeline:
         max_cols = gio["block_tables"].size(1)
         if (state.block_tables.size(1) > max_cols or state.block_tables.size(0) != bs
                 or state.slot_mapping.size(0) != bs or state.context_lens.size(0) != bs):
-            return self.model.project_to_vocab(self.model(input_ids, positions))
+            logits = self.model.project_to_vocab(
+                self.model(input_ids, positions), vocab_range=vr)
+            if vr is not None:
+                return self._expand_restricted_logits(logits, bs)
+            return logits
 
         graph = self._graphs[next(x for x in self._compiled_sizes if x >= bs)]
         gio["input_ids"][:bs] = input_ids
@@ -282,7 +347,10 @@ class InferencePipeline:
         gio["block_tables"][:bs].fill_(-1)
         gio["block_tables"][:bs, :state.block_tables.size(1)] = state.block_tables
         graph.replay()
-        return self.model.project_to_vocab(gio["outputs"][:bs])
+        logits = self.model.project_to_vocab(gio["outputs"][:bs], vocab_range=vr)
+        if vr is not None:
+            return self._expand_restricted_logits(logits, bs)
+        return logits
 
     # -- Sampling helpers ------------------------------------------------
 
